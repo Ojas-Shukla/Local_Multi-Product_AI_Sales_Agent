@@ -1476,21 +1476,15 @@ async function loadLogs() {
 
 // ── Pipeline data ──
 
-// Calls today per subscription — each labelled with the provider it ran on.
+// Local Ollama inference calls recorded on this machine.
 function brainCallChips(data) {
   const chip = (label, n) => '<span class="chip">' + label + ' calls today <b>' + escHtml(String(n || 0)) + '</b></span>';
-  const codex = data.codex_calls_today || 0;
   const st = data.brain_status || {};
-  // A paused brain must not look healthy: say so, and why.
   const paused = st.status === 'paused'
-    ? '<span class="chip" title="' + escHtml(st.reason || '') + '">' +
-      escHtml(st.provider === 'codex' ? 'Codex' : 'Brain') + ' <b>paused</b>: ' +
+    ? '<span class="chip" title="' + escHtml(st.reason || '') + '">Ollama <b>paused</b>: ' +
       escHtml((st.reason || '').slice(0, 120)) + '</span>'
     : '';
-  if (data.brain_provider === 'codex') {
-    return paused + chip('Codex', codex) + (data.claude_calls_today ? chip('Claude', data.claude_calls_today) : '');
-  }
-  return paused + chip('Claude', data.claude_calls_today) + (codex ? chip('Codex', codex) : '');
+  return paused + chip('Ollama (local)', data.ollama_calls_today || 0);
 }
 
 function fmtTokens(n) {
@@ -1512,19 +1506,20 @@ function emailTag(p) {
     escHtml(m.label) + '</span>';
 }
 
-// Quota gauges for the ACTIVE provider only: Claude's are the numbers
-// `/usage` shows in Claude Code; Codex's are the ChatGPT plan's limits.
-// When they can't be read, say so rather than hiding the card.
+// Show local inference status instead of subscription quota for Ollama.
 function quotaCardHtml(data) {
   const provider = data && data.quota_provider;
   if (!provider) return '';
+  if (provider === 'ollama') {
+    return '<h2>Local Ollama Inference</h2><p class="muted">Model requests run on this machine. There is no hosted LLM subscription quota or token billing.</p>';
+  }
   const title = provider === 'codex' ? 'Codex (ChatGPT plan) Quota' : 'Claude Subscription Quota';
   let html = '<h2>' + escHtml(title) + '</h2>';
   if (!data.quota || !Object.keys(data.quota).length) {
     const why = provider === 'codex'
-      ? "Quota unavailable: Sellbird couldn't read your ChatGPT plan's limits (check codex login, the Codex CLI version, and network)."
-      : "Quota unavailable: Sellbird couldn't read your Claude subscription's limits (check claude login and network).";
-    return html + '<p class="muted">' + escHtml(why) + ' Until it can, budgets count Sellbird\'s own calls.</p>';
+      ? "Quota unavailable: Sellbird couldn't read your ChatGPT plan's limits."
+      : "Quota unavailable: Sellbird couldn't read your Claude subscription's limits.";
+    return html + '<p class="muted">' + escHtml(why) + '</p>';
   }
   const labels = {five_hour: '5-hour window', seven_day: 'Weekly', primary: 'Primary window',
                   secondary: 'Secondary window', limit_reached: 'Usage limit reached'};
@@ -1542,7 +1537,6 @@ function quotaCardHtml(data) {
   }
   return html;
 }
-
 async function loadUsage() {
   const data = await api('/api/usage');
   const statsEl = document.getElementById('usage-stats');
@@ -1609,10 +1603,10 @@ async function loadUsage() {
   const anyRows = (data.by_agent || []).length || (data.by_task || []).length;
   if (!anyRows) {
     tablesEl.innerHTML = emptyState(icon('usage'), 'No usage recorded yet',
-      'Once Sellbird starts making model calls (Claude or Codex), every one is logged here with exact calls and tokens by provider, agent and task.');
+      'Once Sellbird starts making local Ollama calls, they are logged here by provider, agent and task.');
   } else {
     const providers = data.by_provider || [];
-    const showProviders = providers.length > 1 || (providers.length === 1 && providers[0].provider !== 'claude');
+    const showProviders = providers.length > 0;
     tablesEl.innerHTML =
       (showProviders ? table('By Provider (30 days)', providers, 'Provider') : '') +
       table('By Agent (30 days)', data.by_agent, 'Agent') +
@@ -1621,12 +1615,6 @@ async function loadUsage() {
   }
 }
 
-// ── Outbox: a decisions desk, not a wall of drafts ──
-//
-// Approving mail is a queue of one-at-a-time judgements. Showing all of them
-// stacked invites a single "approve all" reflex, which is exactly the review
-// the approval ladder exists to prevent. One email fills the pane; the rest
-// wait in the rail.
 
 async function loadOutbox() {
   const [data, mode] = await Promise.all([api('/api/outbox'), api('/api/sending-mode')]);
@@ -1727,6 +1715,7 @@ const CONTACT_SOURCES = {
 };
 
 // What the draft is built on, so every claim can be checked against it.
+
 function renderDeskContext(ctx) {
   if (!ctx) return '';
   const row = (k, v) => v ? '<div class="k">' + k + '</div><div class="v">' + v + '</div>' : '';
@@ -3142,6 +3131,7 @@ setInterval(() => {
 
 let _company = null;
 let _offerIdeas = [];
+let _salesProducts = [];
 
 function ce(t) {
   const d = document.createElement('div');
@@ -3160,7 +3150,60 @@ async function loadCompany() {
   _company = data;
   const o = data.offer || {}, p = data.product || {}, icp = data.icp || {}, s = data.persona || {};
   const objections = Object.entries(p.objection_responses || {});
+  const [productData, profileData] = await Promise.all([
+    api('/api/sales/products'), api('/api/sales/business-profile')
+  ]);
+  const products = productData && Array.isArray(productData.products) ? productData.products : [];
+  _salesProducts = products;
+  const profile = profileData && profileData.profile;
+  const profileHtml = profile ? `<div class="sales-generated">
+    <h4>${ce(profile.company_name)}</h4><p>${ce(profile.overview)}</p>
+    <p><b>Business model:</b> ${ce(profile.business_model)}</p>
+    <p><b>Value proposition:</b> ${ce(profile.value_proposition)}</p>
+    <p><b>Products and services:</b> ${ce(lines(profile.products_and_services))}</p>
+    <p><b>Target markets:</b> ${ce(lines(profile.target_markets))}</p>
+    <p><b>Differentiators:</b> ${ce(lines(profile.differentiators))}</p>
+    <p><b>Unknowns:</b> ${ce(lines(profile.unknowns))}</p>
+    <small>Generated by ${ce(profile.model)} · local inference</small>
+  </div>` : '<p class="desc">No generated profile yet. Generate one from your saved company and product information.</p>';
+  const productsHtml = products.map(prod => `<div class="sales-product">
+    <div><h4>${ce(prod.name)}</h4><p>${ce(prod.description)}</p>
+      ${prod.icp ? `<div class="sales-generated"><b>Product-specific ICP</b>
+        <p><b>Industries:</b> ${ce(lines(prod.icp.industries))}</p>
+        <p><b>Company size:</b> ${ce(prod.icp.company_size)}</p>
+        <p><b>Buyer titles:</b> ${ce(lines(prod.icp.titles))}</p>
+        <p><b>Geography:</b> ${ce(lines(prod.icp.geography))}</p>
+        <p><b>Pain points:</b> ${ce(lines(prod.icp.pain_points))}</p>
+        <p><b>Buying triggers:</b> ${ce(lines(prod.icp.buying_triggers))}</p>
+        <p><b>Disqualifiers:</b> ${ce(lines(prod.icp.disqualifiers))}</p>
+        <p>${ce(prod.icp.rationale)}</p>
+        <small>Generated by ${ce(prod.icp.model)} · local inference</small></div>` : '<p class="desc">No ICP generated for this product yet.</p>'}
+    </div><div class="sales-product-actions">
+      <button class="btn btn-secondary btn-sm" onclick="editSalesProduct('${ce(prod.id)}')">Edit</button>
+      <button class="btn btn-secondary btn-sm" onclick="generateProductICP('${ce(prod.id)}', this)">Generate ICP</button>
+    </div>
+  </div>`).join('');
   body.innerHTML = `
+  <section class="card company-card" aria-labelledby="sales-profile-h">
+    <div class="company-card-head"><h3 id="sales-profile-h">AI business profile</h3>
+      <span class="hint">Generated from locally stored company and product information</span></div>
+    ${profileHtml}
+    <div class="offer-actions"><button class="btn btn-primary btn-sm" id="generate-business-profile" onclick="generateBusinessProfile(this)">Generate business profile</button></div>
+  </section>
+  <section class="card company-card" aria-labelledby="sales-products-h">
+    <div class="company-card-head"><h3 id="sales-products-h">Products and product-specific ICPs</h3>
+      <span class="hint">Each product has its own ideal customer profile</span></div>
+    ${productsHtml || '<p class="desc">No products saved yet.</p>'}
+    <input type="hidden" id="sales-edit-id" value="">
+    <div class="company-grid">
+      <div class="form-group"><label class="form-label" for="sales-new-name">Product name</label><input class="form-input" id="sales-new-name" maxlength="160"></div>
+      <div class="form-group"><label class="form-label" for="sales-new-pricing">Pricing</label><input class="form-input" id="sales-new-pricing" maxlength="500"></div>
+    </div>
+    <div class="form-group"><label class="form-label" for="sales-new-description">Product description</label><textarea class="form-input" id="sales-new-description" rows="3" maxlength="4000"></textarea></div>
+    <div class="form-group"><label class="form-label" for="sales-new-benefits">Key benefits <span class="hint">one per line</span></label><textarea class="form-input" id="sales-new-benefits" rows="2"></textarea></div>
+    <div class="offer-actions"><button class="btn btn-secondary btn-sm" id="sales-save-product" onclick="saveSalesProduct(this)">Add product</button>
+      <button class="btn btn-secondary btn-sm" id="sales-cancel-edit" onclick="cancelSalesProductEdit()" hidden>Cancel edit</button></div>
+  </section>
   <section class="card company-card" aria-labelledby="co-offer-h">
     <div class="company-card-head">
       <h3 id="co-offer-h">Your offer</h3>
@@ -3253,6 +3296,54 @@ async function loadCompany() {
   renderOfferIdeas();
   const badge = document.getElementById('nav-company');
   if (badge) badge.textContent = o.proposed ? '1' : '';
+}
+
+async function generateBusinessProfile(button) {
+  button.disabled = true; const old = button.textContent; button.textContent = 'Generating with local Qwen…';
+  const result = await api('/api/sales/business-profile/generate', {method: 'POST'});
+  button.disabled = false; button.textContent = old;
+  if (result && result.success) { showToast('Business profile generated locally.', 'success'); loadCompany(); }
+  else showToast((result && result.message) || 'Business profile generation failed.', 'error');
+}
+
+async function generateProductICP(productId, button) {
+  button.disabled = true; const old = button.textContent; button.textContent = 'Generating…';
+  const result = await api(`/api/sales/products/${encodeURIComponent(productId)}/icp/generate`, {method: 'POST'});
+  button.disabled = false; button.textContent = old;
+  if (result && result.success) { showToast('Product-specific ICP generated locally.', 'success'); loadCompany(); }
+  else showToast((result && result.message) || 'ICP generation failed.', 'error');
+}
+
+function editSalesProduct(productId) {
+  const product = _salesProducts.find(item => item.id === productId);
+  if (!product) return;
+  document.getElementById('sales-edit-id').value = product.id;
+  document.getElementById('sales-new-name').value = product.name || '';
+  document.getElementById('sales-new-description').value = product.description || '';
+  document.getElementById('sales-new-pricing').value = product.pricing || '';
+  document.getElementById('sales-new-benefits').value = lines(product.key_benefits);
+  document.getElementById('sales-save-product').textContent = 'Save product';
+  document.getElementById('sales-cancel-edit').hidden = false;
+  document.getElementById('sales-new-name').focus();
+}
+
+function cancelSalesProductEdit() {
+  ['sales-edit-id', 'sales-new-name', 'sales-new-description', 'sales-new-pricing', 'sales-new-benefits']
+    .forEach(id => { document.getElementById(id).value = ''; });
+  document.getElementById('sales-save-product').textContent = 'Add product';
+  document.getElementById('sales-cancel-edit').hidden = true;
+}
+
+async function saveSalesProduct(button) {
+  const value = id => document.getElementById(id).value;
+  button.disabled = true;
+  const result = await api('/api/sales/products', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: value('sales-edit-id') || undefined, name: value('sales-new-name'),
+      description: value('sales-new-description'), pricing: value('sales-new-pricing'),
+      key_benefits: splitLines(value('sales-new-benefits'))})});
+  button.disabled = false;
+  if (result && result.success) { showToast('Product saved locally.', 'success'); loadCompany(); }
+  else showToast((result && result.message) || 'Could not save product.', 'error');
 }
 
 function objectionRow(k, v, i) {

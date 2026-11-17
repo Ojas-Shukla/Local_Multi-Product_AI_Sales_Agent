@@ -1168,3 +1168,14 @@ dialog.modal::backdrop { background: rgb(0 0 0 / 0.45); }
 .notice.good { background: var(--good-bg); color: var(--good); }
 .notice.bad { background: var(--bad-bg); color: var(--bad); }
 .notice.info { background: var(--surface-2); color: var(--text-2); }
+
+/* Local AI business profile and multi-product ICP cards. */
+.sales-generated { border: 1px solid var(--line, #ddd); border-radius: 10px; padding: 14px; margin: 10px 0; }
+.sales-generated h4, .sales-product h4 { margin: 0 0 8px; }
+.sales-generated p, .sales-product p { margin: 6px 0; white-space: pre-line; }
+.sales-generated small { color: var(--muted, #777); }
+.sales-product { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 14px 0; border-top: 1px solid var(--line, #ddd); }
+.sales-product > div { min-width: 0; flex: 1; }
+@media (max-width: 640px) { .sales-product { flex-direction: column; } }
+
+.sales-product-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }

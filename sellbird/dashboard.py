@@ -224,6 +224,46 @@ def _check_sellbird_pid() -> int | None:
 # ── Setup Status ──
 
 
+@app.get("/api/system/hardware")
+async def get_system_hardware():
+    """Return local hardware sizing advice and local Ollama readiness."""
+    from sellbird.local_ai.hardware import detect_hardware
+    from sellbird.local_ai.ollama_client import OllamaClient, OllamaError, OllamaSettings
+
+    settings = OllamaSettings.from_env()
+    report = detect_hardware(configured_model=settings.model).to_dict()
+    client = OllamaClient(settings)
+    try:
+        available = await client.is_available()
+        error = ""
+        installed_models = []
+        if available:
+            try:
+                installed_models = await client.list_models()
+            except OllamaError as exc:
+                available = False
+                error = str(exc)
+        model_installed = settings.model in installed_models
+        if not available and not error:
+            error = (
+                f"Ollama is unavailable at {settings.base_url}. Start Ollama and retry; "
+                "the application will not use a cloud fallback."
+            )
+        elif available and not model_installed:
+            error = f"Model '{settings.model}' is not installed. Run: ollama pull {settings.model}"
+        report["ollama"] = {
+            "available": available,
+            "configured_model": settings.model,
+            "model_installed": model_installed,
+            "installed_models": installed_models,
+            "error": error,
+            "cloud_fallback": False,
+        }
+    finally:
+        await client.close()
+    return report
+
+
 @app.get("/api/setup-status")
 async def get_setup_status():
     """Check what's configured and what still needs setup."""
@@ -656,6 +696,78 @@ async def get_company():
         return JSONResponse({"error": f"Couldn't read your config: {e}"}, status_code=500)
 
 
+@app.get("/api/sales/products")
+async def get_sales_products():
+    """List locally stored products and their product-specific ICPs."""
+    from sellbird.config import load_config
+    from sellbird.sales_intelligence import list_products
+    state = _state()
+    await state.init_db()
+    return {"products": await list_products(state, load_config())}
+
+
+@app.post("/api/sales/products")
+async def save_sales_product(request: Request):
+    """Create or update a product in the local multi-product catalogue."""
+    from sellbird.config import load_config
+    from sellbird.sales_intelligence import save_product
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    try:
+        state = _state()
+        await state.init_db()
+        product = await save_product(state, body, load_config())
+        return {"success": True, "product": product}
+    except ValueError as error:
+        return JSONResponse({"success": False, "message": str(error)}, status_code=400)
+    except Exception as error:
+        logger.exception("Could not save sales product")
+        return JSONResponse({"success": False, "message": f"Could not save product: {error}"}, status_code=500)
+
+
+@app.get("/api/sales/business-profile")
+async def get_sales_business_profile():
+    from sellbird.sales_intelligence import get_business_profile
+    state = _state()
+    await state.init_db()
+    return {"profile": await get_business_profile(state)}
+
+
+@app.post("/api/sales/business-profile/generate")
+async def generate_sales_business_profile():
+    """Generate a company profile using local configuration and local Ollama only."""
+    from sellbird.sales_intelligence import generate_business_profile
+    try:
+        brain, state, config = await _offer_brain()
+        from sellbird.offer import _skill_text
+        profile = await generate_business_profile(
+            brain, state, config,
+            knowledge=_skill_text(PROJECT_ROOT, "product_knowledge"),
+            competitors=_skill_text(PROJECT_ROOT, "competitive_intel"),
+        )
+        return {"success": True, "profile": profile}
+    except ValueError as error:
+        return JSONResponse({"success": False, "message": str(error)}, status_code=400)
+    except Exception as error:
+        logger.warning("Local business profile generation failed: %s", error)
+        return JSONResponse({"success": False, "message": str(error)}, status_code=503)
+
+
+@app.post("/api/sales/products/{product_id}/icp/generate")
+async def generate_sales_product_icp(product_id: str):
+    """Generate and save the ICP for one selected product using local Ollama."""
+    from sellbird.sales_intelligence import generate_product_icp, get_business_profile
+    try:
+        brain, state, config = await _offer_brain()
+        profile = await get_business_profile(state)
+        result = await generate_product_icp(brain, state, config, product_id, profile)
+        return {"success": True, **result}
+    except ValueError as error:
+        return JSONResponse({"success": False, "message": str(error)}, status_code=400)
+    except Exception as error:
+        logger.warning("Local product ICP generation failed: %s", error)
+        return JSONResponse({"success": False, "message": str(error)}, status_code=503)
+
+
 @app.post("/api/company")
 async def save_company_route(request: Request):
     """Save one edited section of Your company to the config file."""
@@ -667,6 +779,12 @@ async def save_company_route(request: Request):
         return JSONResponse({"success": False, "message": "Nothing to save."}, status_code=400)
     try:
         save_company(_offer_config_file(), section, fields)
+        if section in {"product", "icp"}:
+            from sellbird.config import load_config
+            from sellbird.sales_intelligence import sync_configured_product
+            state = _state()
+            await state.init_db()
+            await sync_configured_product(state, load_config())
     except ValueError as e:
         return JSONResponse({"success": False, "message": f"Not saved: {e}."}, status_code=400)
     except Exception as e:
@@ -1056,11 +1174,10 @@ async def get_stats():
         # get_usage_today use date.today()); SQLite's date('now') is UTC and
         # can select a different day's counts on either side of UTC midnight.
         usage = await query_db(
-            "SELECT claude_calls, codex_calls FROM usage_log WHERE date = ?",
+            "SELECT ollama_calls FROM usage_log WHERE date = ?",
             (date.today().isoformat(),),
         )
-        usage_today = (usage[0]["claude_calls"] or 0) if usage else 0
-        codex_today = (usage[0]["codex_calls"] or 0) if usage else 0
+        ollama_today = (usage[0]["ollama_calls"] or 0) if usage else 0
 
         return {
             "prospects": {"total": prospect_total, "by_status": prospect_map},
@@ -1068,8 +1185,7 @@ async def get_stats():
             "conversations": {"total": sum(convo_map.values()), "by_status": convo_map},
             "pipeline": pipeline,
             "actions_total": action_count,
-            "claude_calls_today": usage_today,
-            "codex_calls_today": codex_today,
+            "ollama_calls_today": ollama_today,
             "brain_provider": _active_provider(),
             "brain_status": await _brain_status(),
         }
@@ -1100,7 +1216,7 @@ def _active_brain():
 
 async def _brain_status() -> dict:
     """Last recorded brain health transition ({} if none): lets the
-    dashboard say "Codex paused: <why>" instead of looking healthy."""
+    dashboard say "Ollama paused: <why>" instead of looking healthy."""
     from sellbird.brain import BRAIN_STATUS_KEY, active_brain_status
     rows = await query_db("SELECT value FROM settings WHERE key = ?", (BRAIN_STATUS_KEY,))
     # Only the configured provider's health (a stale Codex pause isn't
@@ -2426,7 +2542,7 @@ async def get_today():
         # Ordered by how much it blocks Sellbird from doing anything at all.
         brain = await _brain_status()
         if brain.get("status") == "paused":
-            who = "Codex" if brain.get("provider") == "codex" else "Sellbird's model"
+            who = "Ollama" if brain.get("provider") == "ollama" else "Sellbird's model"
             items.append({
                 "key": "brain-paused", "tone": "bad",
                 "title": f"{who} is paused, so Sellbird is waiting",
