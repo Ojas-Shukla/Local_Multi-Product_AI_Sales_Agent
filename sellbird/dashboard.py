@@ -1302,6 +1302,33 @@ async def get_usage():
     }
 
 
+@app.get("/api/prospects/{prospect_id}/research")
+async def get_prospect_research(prospect_id: str):
+    """Return the latest locally generated research for a saved prospect."""
+    state = _state()
+    await state.init_db()
+    if not await state.get_prospect(prospect_id):
+        return JSONResponse({"success": False, "message": "Prospect not found."}, status_code=404)
+    return {"success": True, "research": await state.get_prospect_research(prospect_id)}
+
+
+@app.post("/api/prospects/{prospect_id}/research")
+async def generate_prospect_research_route(prospect_id: str, request: Request):
+    """Research a prospect from existing local records with Ollama; no web fetches."""
+    from sellbird.prospect_research import generate_prospect_research
+    try:
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        product_id = str((body or {}).get("product_id") or "")[:40]
+        brain, state, _config = await _offer_brain()
+        research = await generate_prospect_research(brain, state, prospect_id, product_id)
+        return {"success": True, "research": research}
+    except ValueError as error:
+        return JSONResponse({"success": False, "message": str(error)}, status_code=400)
+    except Exception as error:
+        logger.warning("Local prospect research failed prospect=%s: %s", prospect_id, error)
+        return JSONResponse({"success": False, "message": str(error)}, status_code=503)
+
+
 @app.get("/api/prospects")
 async def get_prospects():
     rows = await query_db("SELECT * FROM prospects ORDER BY created_at DESC LIMIT 200")

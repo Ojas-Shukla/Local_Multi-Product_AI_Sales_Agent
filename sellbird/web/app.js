@@ -2258,12 +2258,76 @@ function renderContacts() {
         ? '<button class="btn btn-ghost btn-sm" onclick="toggleOptOut(' + i + ')" ' +
           'aria-expanded="' + (_optOut.id === p.id) + '" title="What made Sellbird stop emailing them">' +
           (p.status === 'opted_out' ? 'Why?' : 'Opt-out history') + '</button>' : '') +
+        '<button class="btn btn-ghost btn-sm row-action" onclick="toggleProspectResearch(' + i + ')" ' +
+        'title="Research using previously downloaded local data">Research</button>' +
         '<button class="btn btn-ghost btn-sm row-action" onclick="fbProspect(' + i + ')" ' +
         'title="Leave feedback on this contact">Feedback</button></div></td></tr>';
     if (_optOut.id === p.id) html += '<tr class="detail-row"><td colspan="8">' + optOutPanel(p) + '</td></tr>';
+    if (_prospectResearch.id === p.id) html += '<tr class="detail-row"><td colspan="8">' + prospectResearchPanel(p) + '</td></tr>';
   }
   rowsEl.innerHTML = html + '</tbody></table></div>' +
     '<div class="table-foot">' + rows.length + ' of ' + _prospects.length + ' contacts</div>';
+}
+
+// Prospect research is generated only from company/contact/observation records
+// already stored locally. The UI makes that provenance explicit.
+let _prospectResearch = {id: null, data: null, loading: false};
+let _researchProducts = [];
+async function toggleProspectResearch(i) {
+  const p = _prospects[i];
+  if (!p) return;
+  if (_prospectResearch.id === p.id) {
+    _prospectResearch = {id: null, data: null, loading: false}; renderContacts(); return;
+  }
+  _prospectResearch = {id: p.id, data: null, loading: true}; renderContacts();
+  const [data, productsData] = await Promise.all([
+    api('/api/prospects/' + encodeURIComponent(p.id) + '/research'),
+    api('/api/sales/products')
+  ]);
+  if (_prospectResearch.id !== p.id) return;
+  _researchProducts = productsData && Array.isArray(productsData.products) ? productsData.products : [];
+  _prospectResearch = {id: p.id, data: data && data.research ? data.research : null, loading: false};
+  renderContacts();
+}
+function prospectResearchPanel(p) {
+  const d = _prospectResearch.data;
+  if (_prospectResearch.loading) return '<div class="optout-panel muted">Loading saved research…</div>';
+  const list = (items) => Array.isArray(items) && items.length
+    ? '<ul>' + items.map(x => '<li>' + escHtml(x) + '</li>').join('') + '</ul>'
+    : '<p class="muted">No information available.</p>';
+  let html = '<div class="optout-panel"><div class="cell-row" style="justify-content:space-between"><b>Local prospect research</b>' +
+    '<span class="muted">Previously downloaded data · no website fetch</span></div>';
+  if (d) {
+    html += '<p>' + escHtml(d.company_overview || '') + '</p><p>' + escHtml(d.contact_context || '') + '</p>' +
+      '<b>Relevant facts</b>' + list(d.relevant_facts) + '<b>Potential relevance (hypotheses)</b>' + list(d.potential_relevance) +
+      '<b>Research gaps</b>' + list(d.research_gaps) + '<b>Suggested research questions</b>' + list(d.suggested_research_questions) +
+      '<p><b>Product fit:</b> ' + escHtml(d.product_fit || '') + '</p>' +
+      '<p class="muted">Confidence: ' + escHtml(d.confidence || 'low') + ' · Sources: ' + escHtml(d.source_count || 0) +
+      ' · Model: ' + escHtml(d.model || 'local') + '</p>';
+    if (Array.isArray(d.evidence) && d.evidence.length) html += '<b>Evidence</b><ul>' + d.evidence.map(e =>
+      '<li>' + escHtml(e.fact || '') + (e.source ? ' — ' + escHtml(e.source) : '') + '</li>').join('') + '</ul>';
+  } else {
+    html += '<p class="muted">No saved research yet. Generate it from the prospect and company information already in your local database.</p>';
+  }
+  html += '<label class="form-label" for="research-product-' + escHtml(p.id) + '">Product context</label>' +
+    '<select class="form-input" id="research-product-' + escHtml(p.id) + '"><option value="">No product selected</option>' +
+    _researchProducts.map(prod => '<option value="' + escHtml(prod.id) + '"' +
+      (d && d.product_id === prod.id ? ' selected' : '') + '>' + escHtml(prod.name) + '</option>').join('') + '</select>' +
+    '<button class="btn btn-secondary btn-sm" onclick="runProspectResearch(' + "'" + escHtml(p.id) + "'" + ')">' +
+    (d ? 'Regenerate research' : 'Generate local research') + '</button></div>';
+  return html;
+}
+async function runProspectResearch(prospectId) {
+  _prospectResearch = {id: prospectId, data: null, loading: true}; renderContacts();
+  const productSelect = document.getElementById('research-product-' + prospectId);
+  const productId = productSelect ? productSelect.value : '';
+  const data = await api('/api/prospects/' + encodeURIComponent(prospectId) + '/research', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({product_id: productId})
+  });
+  if (_prospectResearch.id !== prospectId) return;
+  _prospectResearch = {id: prospectId, data: data && data.research ? data.research : null, loading: false};
+  if (!data || !data.success) showToast((data && data.message) || 'Could not generate local research.', 'error');
+  renderContacts();
 }
 
 // Why someone is opted out, and undoing it. Sellbird never moves anyone off

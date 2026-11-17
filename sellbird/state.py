@@ -580,6 +580,21 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_local_ai_queue_status_created
         ON local_ai_task_queue(status, created_at);
     """,
+    # ── v19: locally generated prospect research, grounded in downloaded records ──
+    """
+    CREATE TABLE IF NOT EXISTS prospect_research (
+        prospect_id TEXT PRIMARY KEY REFERENCES prospects(id) ON DELETE CASCADE,
+        product_id TEXT DEFAULT '',
+        research_json TEXT NOT NULL,
+        model TEXT DEFAULT '',
+        provider TEXT DEFAULT 'ollama_local',
+        source_count INTEGER DEFAULT 0,
+        generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_prospect_research_updated
+        ON prospect_research(updated_at);
+    """,
 ]
 
 BRAIN_PROVIDERS = ("ollama",)
@@ -2230,6 +2245,41 @@ class StateManager:
         except (json.JSONDecodeError, TypeError):
             return []
         return [l for l in known if isinstance(l, str)] if isinstance(known, list) else []
+
+    async def save_prospect_research(self, prospect_id: str, product_id: str,
+                                     research: dict, model: str, source_count: int) -> None:
+        """Persist locally generated prospect research for one downloaded contact."""
+        payload = json.dumps(research, ensure_ascii=False)
+        async with self._connect() as db:
+            await db.execute(
+                """INSERT INTO prospect_research
+                   (prospect_id, product_id, research_json, model, provider, source_count,
+                    generated_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'ollama_local', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                   ON CONFLICT(prospect_id) DO UPDATE SET
+                     product_id=excluded.product_id, research_json=excluded.research_json,
+                     model=excluded.model, provider='ollama_local',
+                     source_count=excluded.source_count, generated_at=CURRENT_TIMESTAMP,
+                     updated_at=CURRENT_TIMESTAMP""",
+                (prospect_id, product_id or '', payload, model or '', int(source_count)),
+            )
+            await db.commit()
+
+    async def get_prospect_research(self, prospect_id: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM prospect_research WHERE prospect_id = ?", (prospect_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        try:
+            result['research'] = json.loads(result.pop('research_json'))
+        except (TypeError, json.JSONDecodeError):
+            result['research'] = {}
+        return result
 
     async def get_setting(self, key: str, default: str = "") -> str:
         async with self._connect() as db:

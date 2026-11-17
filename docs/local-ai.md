@@ -117,3 +117,24 @@ The dashboard's **Your company** section now supports two additional local workf
 - **Product-specific ICP generation** runs separately for each saved product. Each product stores its own ICP fields (industries, company size, buyer titles, geography, pain points, buying triggers, disqualifiers, and rationale), so generating an ICP for one product does not overwrite another product's ICP.
 
 The first catalogue entry is seeded from the existing `sellbird.yaml` product and ICP configuration. Existing **What you sell** and **Who you sell to** edits continue to update that first entry. Additional products are stored locally and can have their own ICPs. Both generation endpoints use `Brain.think_json` and the configured local Ollama model; there is no cloud fallback. Generated records include the model/provider and timestamp for traceability.
+
+
+## Prospect research from previously downloaded data (Phase 5)
+
+The Contacts table provides a **Research** action for an existing prospect. The workflow reads
+the saved contact and company records and previously collected SQLite observations. It does not
+fetch the company website, run a new search, or call a prospecting/enrichment service. This makes
+the local research workflow usable after the initial prospect data has been downloaded and while
+the computer is offline.
+
+The selected local Ollama model produces a structured research summary, relevant facts,
+potential relevance hypotheses, research gaps, suggested questions, a product-fit note, and a
+confidence label. Evidence references shown in the UI are assembled from source URLs already
+present in the local records rather than accepting model-invented URLs. Results are persisted in
+SQLite in `prospect_research` and tagged with `provider=ollama_local`, model, source mode, and
+generation timestamp. If Ollama is unavailable, the API returns an explicit error and Brain's
+existing local-AI queue records the failed inference request; no cloud model is contacted.
+
+API endpoints: `GET /api/prospects/{prospect_id}/research` retrieves the saved result;
+`POST /api/prospects/{prospect_id}/research` generates or refreshes it. An optional `product_id`
+can attach the matching saved product ICP to the research prompt.
