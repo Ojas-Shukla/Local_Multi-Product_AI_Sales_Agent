@@ -562,6 +562,24 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE usage_log ADD COLUMN ollama_calls INTEGER DEFAULT 0;
     """,
+    # ── v18: durable queue for local AI work paused by Ollama outages ──
+    """
+    CREATE TABLE IF NOT EXISTS local_ai_task_queue (
+        id TEXT PRIMARY KEY,
+        agent TEXT DEFAULT '',
+        task TEXT DEFAULT '',
+        prompt TEXT NOT NULL,
+        expect_json INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'pending',
+        attempts INTEGER DEFAULT 0,
+        result_text TEXT DEFAULT '',
+        last_error TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_local_ai_queue_status_created
+        ON local_ai_task_queue(status, created_at);
+    """,
 ]
 
 BRAIN_PROVIDERS = ("ollama",)
@@ -2608,6 +2626,50 @@ class StateManager:
             ) as cursor:
                 rows = await cursor.fetchall()
                 return {row[0]: row[1] for row in rows}
+
+    # ── Deferred local AI tasks ──
+
+    async def enqueue_local_ai_task(
+        self, prompt: str, *, agent: str = "", task: str = "", expect_json: bool = False
+    ) -> str:
+        """Persist an inference request when local Ollama is unavailable."""
+        task_id = _new_id()
+        async with self._connect() as db:
+            await db.execute(
+                """INSERT INTO local_ai_task_queue
+                   (id, agent, task, prompt, expect_json, status)
+                   VALUES (?, ?, ?, ?, ?, 'pending')""",
+                (task_id, agent, task, prompt, int(expect_json)),
+            )
+            await db.commit()
+        return task_id
+
+    async def get_pending_local_ai_tasks(self, limit: int = 10) -> list[dict]:
+        """Return oldest queued local inference requests."""
+        limit = max(1, min(int(limit), 100))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT * FROM local_ai_task_queue WHERE status IN ('pending', 'processing')
+                   ORDER BY created_at, id LIMIT ?""", (limit,)
+            ) as cursor:
+                return [dict(row) for row in await cursor.fetchall()]
+
+    async def update_local_ai_task(
+        self, task_id: str, *, status: str, result_text: str = "", error: str = ""
+    ) -> None:
+        """Update a queued inference task after a retry attempt."""
+        if status not in {"pending", "processing", "completed", "failed"}:
+            raise ValueError(f"invalid local AI task status: {status}")
+        async with self._connect() as db:
+            await db.execute(
+                """UPDATE local_ai_task_queue SET status = ?, result_text = ?,
+                   last_error = ?,
+                   attempts = attempts + CASE WHEN ? = 'processing' THEN 0 ELSE 1 END,
+                   updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                (status, result_text, error[:1000], status, task_id),
+            )
+            await db.commit()
 
     # ── Usage Tracking ──
 

@@ -175,9 +175,25 @@ class Brain:
         if self.provider != "ollama":
             logger.error("Refusing non-local inference provider: %s", self.provider)
             return ""
-        return await self._think_ollama(
+        response = await self._think_ollama(
             prompt, expect_json=expect_json, timeout=timeout, agent=agent, task=task
         )
+        if not response and self.unavailable:
+            # Keep the exact request in SQLite so it can be retried after the
+            # local Ollama service/model becomes available again. No cloud
+            # provider is consulted and callers retain the existing empty
+            # response behaviour while the task waits.
+            enqueue = getattr(self.state, "enqueue_local_ai_task", None)
+            if enqueue is not None:
+                try:
+                    queued_id = await enqueue(
+                        prompt, agent=agent, task=task, expect_json=expect_json
+                    )
+                    logger.warning("LOCAL AI task queued id=%s agent=%s task=%s",
+                                   queued_id, agent, task)
+                except Exception as error:
+                    logger.error("Could not queue failed local AI task: %s", error)
+        return response
 
     async def think_json(
         self,
@@ -312,6 +328,49 @@ class Brain:
             self.model, agent, task, duration_ms,
         )
         return response
+
+    async def process_queued_tasks(self, limit: int = 10) -> dict:
+        """Retry pending inference requests after local Ollama is restored.
+
+        Results are stored in SQLite for inspection. This method never sends
+        queued prompts to a hosted service. A failed retry returns the task to
+        pending state so a later invocation can try again.
+        """
+        pending_reader = getattr(self.state, "get_pending_local_ai_tasks", None)
+        updater = getattr(self.state, "update_local_ai_task", None)
+        if pending_reader is None or updater is None:
+            return {"processed": 0, "completed": 0, "pending": 0,
+                    "error": "Persistent local AI queue is unavailable."}
+        rows = await pending_reader(limit=limit)
+        if not rows:
+            return {"processed": 0, "completed": 0, "pending": 0, "error": ""}
+        problem = await self.preflight()
+        if problem:
+            return {"processed": 0, "completed": 0, "pending": len(rows),
+                    "error": problem}
+        completed = 0
+        processed = 0
+        for row in rows:
+            task_id = row["id"]
+            await updater(task_id, status="processing")
+            processed += 1
+            result = await self._think_ollama(
+                row["prompt"], expect_json=bool(row.get("expect_json")),
+                timeout=DEFAULT_TIMEOUT_SECONDS, agent=row.get("agent", "queued"),
+                task=row.get("task", "retry"),
+            )
+            if result:
+                await updater(task_id, status="completed", result_text=result)
+                completed += 1
+            else:
+                await updater(task_id, status="pending", error=self.paused_reason or
+                              "Local inference returned no response.")
+                break
+        remaining = await pending_reader(limit=100)
+        logger.info("LOCAL AI queue retry processed=%s completed=%s pending=%s",
+                    processed, completed, len(remaining))
+        return {"processed": processed, "completed": completed,
+                "pending": len(remaining), "error": self.paused_reason}
 
     def load_prompt(self, prompt_name: str, **kwargs) -> str:
         """Load a prompt template from the prompts/ directory and fill in variables."""
