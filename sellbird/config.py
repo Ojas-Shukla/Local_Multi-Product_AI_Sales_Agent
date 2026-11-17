@@ -696,35 +696,27 @@ class UsageConfig(BaseModel):
         return v
 
 
-BRAIN_PROVIDERS = ("claude", "codex")
-CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
-
+BRAIN_PROVIDERS = ("ollama",)
 # Model names are passed to a CLI, so they must look like a model name and
 # never like a flag ("-x") or anything a shell would treat specially.
 _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
 
 
 class BrainConfig(BaseModel):
-    """Which subscription Sellbird thinks with.
+    """Local-only inference configuration for Ollama."""
 
-    ``claude`` (default) runs Claude Code headless on your Claude plan.
-    ``codex`` runs Codex on your ChatGPT plan. There is never an automatic
-    fallback between them, and an explicit ``model`` only affects Sellbird —
-    your own Claude Code / Codex settings are never read or changed.
-    """
-
-    provider: str = "claude"
-    model: str = ""  # empty = the provider's own default
-    reasoning_effort: str = ""  # codex only; empty = model default
+    provider: str = "ollama"
+    model: str = ""  # empty = OLLAMA_MODEL or qwen3:1.7b
+    reasoning_effort: str = ""  # retained for compatibility; unused by Ollama
 
     @field_validator("provider", mode="before")
     @classmethod
     def _valid_provider(cls, v) -> str:
-        v = str(v or "claude").strip().lower()
+        v = str(v or "ollama").strip().lower()
         if v not in BRAIN_PROVIDERS:
             raise ValueError(
                 f"'{v}' is not a supported brain provider. "
-                f"Use one of: {', '.join(BRAIN_PROVIDERS)}."
+                f"Only local Ollama inference is permitted."
             )
         return v
 
@@ -740,11 +732,8 @@ class BrainConfig(BaseModel):
     @classmethod
     def _valid_effort(cls, v) -> str:
         v = str(v or "").strip().lower()
-        if v and v not in CODEX_REASONING_EFFORTS:
-            raise ValueError(
-                f"'{v}' is not a valid reasoning effort. "
-                f"Use one of: {', '.join(CODEX_REASONING_EFFORTS)}."
-            )
+        if v:
+            raise ValueError("reasoning_effort is not supported by the local Ollama configuration.")
         return v
 
 

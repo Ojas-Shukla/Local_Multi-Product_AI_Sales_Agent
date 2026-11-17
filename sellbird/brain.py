@@ -1,10 +1,7 @@
-"""Brain — Sellbird's thinking engine.
+"""Brain — local-only Ollama inference for the EDXSO sales agent.
 
-Runs on the operator's Claude subscription (Claude Code headless, the
-default) or, when ``brain.provider: codex`` is configured, their ChatGPT
-subscription through an isolated Codex runtime (see sellbird/codex.py). The
-provider is fixed per Brain; a failing provider never falls back to the
-other one.
+Every application model request is sent to the local Ollama server. There is
+no hosted LLM provider or cloud fallback in this execution path.
 """
 
 import asyncio
@@ -25,38 +22,17 @@ from sellbird.workspace_home import current_home
 PROMPTS_DIR = PROJECT_ROOT / "prompts"
 SKILLS_DIR = PROJECT_ROOT / "skills"
 
-# Subprocess safety limits
-DEFAULT_TIMEOUT_SECONDS = 300  # a single Claude call should never hang forever
-DEFAULT_MAX_RETRIES = 2  # retries on transient failures (non-zero exit, timeout)
-RETRY_BASE_DELAY = 5.0  # seconds; doubles per attempt
-KILL_REAP_SECONDS = 10.0  # waiting for a killed child on shutdown
-
-# stderr fragments that indicate retrying is pointless
-_NON_RETRYABLE_PATTERNS = (
-    "not logged in",
-    "please run `claude login`",
-    "invalid api key",
-    "unauthorized",
-)
+# Local inference timeout and compatibility argument retained for callers.
+DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_MAX_RETRIES = 0
 
 
-PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+PROVIDER_LABELS = {"ollama": "Ollama"}
 
 # Settings key holding the brain's last health transition, for `sellbird
 # status` and the dashboard: {"provider", "status": "ok"|"paused", "reason",
 # "since", and for pauses "kind" (plus "until", epoch seconds, for usage limits)}.
 BRAIN_STATUS_KEY = "brain_status"
-
-# Codex failures that repeat on every call until the operator acts (login,
-# CLI version, model choice, an unsafe Codex config layer). After one, the
-# Brain stops starting runtimes until something changes.
-_PERSISTENT_CODEX_KINDS = {"setup", "auth", "isolation"}
-# Re-check a paused provider at least this often even if nothing changed
-# on disk (e.g. a managed config layer was fixed).
-PROVIDER_RECHECK_SECONDS = 1800
-# After Codex reports the plan's usage limit, stop calling it (and keep the
-# budget gate closed) for this long.
-USAGE_LIMIT_PAUSE_SECONDS = 3600
 
 
 def parse_brain_status(raw: str) -> dict:
@@ -69,15 +45,13 @@ def parse_brain_status(raw: str) -> dict:
 
 
 def active_brain_status(raw: str, provider: str) -> dict:
-    """The stored status if it belongs to ``provider`` (the one configured
-    now), else {}: a pause recorded for Codex says nothing about Claude."""
+    """Return the stored status only when it belongs to the configured provider."""
     status = parse_brain_status(raw)
     return status if status.get("provider") == provider else {}
 
 
 class BrainUnavailable(Exception):
-    """The provider can't be used until the operator acts. Raised only where
-    a caller must leave its input untouched for a later retry."""
+    """The local inference provider is unavailable."""
 
 
 def _read_knowledge(folder: str, name: str) -> str:
@@ -97,43 +71,36 @@ def _read_knowledge(folder: str, name: str) -> str:
 
 
 class Brain:
-    def __init__(self, state: StateManager, brain_config=None, transport=None):
-        """``transport``, when given, replaces the Claude and Codex CLIs: an
-        ``async transport(prompt, *, agent, task, timeout, expect_json) -> str``
-        that returns the model's text ("" on failure). It may carry a
-        ``paused_reason`` attribute (str) to pause calls the way a usage limit
-        does. This is the public seam a server running Sellbird for others
-        (the hosted product's API brain) plugs into, instead of overriding
-        ``think``."""
+    def __init__(self, state: StateManager, brain_config=None):
+        """Create a Brain whose only inference provider is local Ollama."""
         from sellbird.config import BrainConfig
 
         self.state = state
-        self.transport = transport
         self.config = brain_config or BrainConfig()
         self.provider = self.config.provider
-        self.model = self.config.model
-        self.codex = None
+        from sellbird.local_ai.ollama_client import OllamaClient, OllamaSettings
+        settings = OllamaSettings.from_env()
+        if self.config.model:
+            settings = OllamaSettings(
+                base_url=settings.base_url,
+                model=self.config.model,
+                timeout_seconds=settings.timeout_seconds,
+            )
+        self.ollama = OllamaClient(settings)
+        self.model = settings.model
         # Whether the last think_json got no reply at all (an outage, logout,
         # rate limit or timeout), as opposed to a reply that wasn't valid
         # JSON. Callers that count model failures must not count outages.
         self.last_reply_empty = False
-        # Codex health (unused for Claude, whose behaviour is unchanged).
         self.unavailable = ""
         self._unavailable_at = 0.0
         self._unavailable_fingerprint = None
         self._usage_limited_until = 0.0
         self._usage_pause_recorded = False
         self._status_synced = False
-        if self.provider == "codex":
-            from sellbird.codex import CodexClient, CodexQuotaClient
-            self.codex = CodexClient(
-                model=self.model, reasoning_effort=self.config.reasoning_effort
-            )
-            self.quota = CodexQuotaClient(self.codex)
-        else:
-            # Lazy import avoids a cycle (quota -> usage -> state).
-            from sellbird.integrations.quota import QuotaClient
-            self.quota = QuotaClient()
+        # Local inference has no subscription quota endpoint. The app uses
+        # its own local call counter for the existing daily-work guard.
+        self.quota = None
 
     @property
     def provider_label(self) -> str:
@@ -141,111 +108,33 @@ class Brain:
 
     @property
     def paused_reason(self) -> str:
-        """Why calls are currently being skipped ("" when they aren't)."""
-        transport_paused = str(getattr(self.transport, "paused_reason", "") or "") \
-            if self.transport is not None else ""
-        if transport_paused:
-            return transport_paused
-        if self.unavailable:
-            return self.unavailable
-        if time.monotonic() < self._usage_limited_until:
-            return f"{self.provider_label} usage limit reached for this plan"
-        return ""
+        """Why local inference is currently unavailable, or an empty string."""
+        return self.unavailable
 
     async def preflight(self) -> str:
-        """Can this Brain be used right now? Returns "" or the reason not.
+        """Verify the local Ollama server and configured model before inference."""
+        from sellbird.local_ai.ollama_client import OllamaError
 
-        Codex only (Claude keeps its existing behaviour): runs the adapter's
-        full pre-prompt check (CodexClient.preflight): CLI version, route and
-        lockdown attested with no login in the runtime, the native login read
-        only (expiry, renewal), then with the access-only copy the configured
-        model against the catalog, the ChatGPT account, and a started
-        tool-less thread. No turn, so no inference; nothing is written to the
-        native login. While paused, the check is repeated only when the login
-        file or the Codex executable changes, or every
-        PROVIDER_RECHECK_SECONDS, so a persistent problem doesn't start
-        runtimes every heartbeat.
-        """
-        if self.provider != "codex":
-            return await self._claude_preflight()
-        from sellbird.codex import CodexError
-
-        await self._expire_usage_pause()
-        if self.unavailable:
-            unchanged = self.codex.fingerprint() == self._unavailable_fingerprint
-            recent = time.monotonic() - self._unavailable_at < PROVIDER_RECHECK_SECONDS
-            if unchanged and recent:
-                return self.unavailable
         try:
-            await self.codex.preflight()
-        except CodexError as e:
-            if e.kind in _PERSISTENT_CODEX_KINDS:
-                await self._mark_unavailable(e)
-                return self.unavailable
-            return str(e)  # transient: skip this cycle, check again next time
-        except Exception as e:
-            return f"Codex preflight failed unexpectedly ({type(e).__name__})."
+            await self.ollama.require_model()
+        except OllamaError as error:
+            await self._mark_unavailable(error)
+            return self.unavailable
         if self.unavailable:
             await self._mark_available()
         elif not self._status_synced:
-            logger.info(
-                f"Codex ready: supported CLI, isolation verified, login and account "
-                f"valid, model {self.model or 'auto'} usable with no tools (no prompt sent).")
-            # A pause recorded before a restart must not outlive the problem.
+            logger.info("Ollama ready: local model %s is installed; no cloud inference configured.", self.model)
             self._status_synced = True
             try:
                 stored = parse_brain_status(await self.state.get_setting(BRAIN_STATUS_KEY))
             except Exception:
                 stored = {}
-            until = stored.get("until")
-            if (stored.get("status") == "paused" and stored.get("kind") == "usage_limit"
-                    and isinstance(until, (int, float)) and until > time.time()):
-                # Still inside a usage-limit pause recorded before a restart.
-                self._usage_limited_until = time.monotonic() + (until - time.time())
-                self._usage_pause_recorded = True
-            elif stored.get("status") == "paused":
+            if stored.get("status") == "paused":
                 await self._mark_available()
         return ""
 
-    async def _claude_preflight(self) -> str:
-        """Claude: the installed CLI must support every isolation flag
-        (claude_runtime.check_cli). Runs ``claude --help`` only: no login
-        check, no model call. Returns "" or why calls are paused."""
-        from sellbird.claude_runtime import ClaudeRuntimeError, check_cli
-
-        try:
-            await asyncio.to_thread(check_cli)
-        except ClaudeRuntimeError as e:
-            await self._mark_unavailable(e)
-            return self.unavailable
-        if self.unavailable:
-            await self._mark_available()
-        return ""
-
     def _fingerprint(self):
-        if self.provider == "codex":
-            return self.codex.fingerprint()
-        from sellbird.claude_runtime import fingerprint
-        return fingerprint()
-
-    async def _start_usage_pause(self):
-        self._usage_limited_until = time.monotonic() + USAGE_LIMIT_PAUSE_SECONDS
-        until = time.time() + USAGE_LIMIT_PAUSE_SECONDS
-        resume = time.strftime("%H:%M UTC", time.gmtime(until))
-        await self._record_status(
-            "paused",
-            f"{self.provider_label} usage limit reached for this plan; calls resume "
-            f"after {resume}.",
-            kind="usage_limit", until=until)
-        self._usage_pause_recorded = True
-
-    async def _expire_usage_pause(self):
-        """Record recovery once a usage-limit pause has run out."""
-        if self._usage_pause_recorded and time.monotonic() >= self._usage_limited_until:
-            self._usage_pause_recorded = False
-            if not self.unavailable:
-                logger.info(f"{self.provider_label} usage-limit pause is over; resuming.")
-                await self._record_status("ok", "")
+        return (self.ollama.settings.base_url, self.ollama.settings.model)
 
     async def _mark_unavailable(self, error):
         first = not self.unavailable or self.unavailable != str(error)
@@ -282,327 +171,13 @@ class Brain:
         agent: str = "",
         task: str = "",
     ) -> str:
-        """Send a prompt to the configured provider and return the response.
-
-        Retries transient failures with exponential backoff and enforces a
-        hard timeout so a hung CLI call can never stall the heartbeat.
-        Returns "" on unrecoverable failure (callers already handle empty).
-
-        ``agent``/``task`` label the call in the usage_events ledger so the
-        dashboard can attribute tokens and cost to specific work.
-        """
-        if self.transport is not None:
-            return await self._think_transport(prompt, expect_json=expect_json,
-                                               timeout=timeout, agent=agent, task=task)
-        if self.provider == "codex":
-            return await self._think_codex(
-                prompt, session_id=session_id, timeout=timeout,
-                max_retries=max_retries, agent=agent, task=task,
-            )
-
-        from sellbird import claude_runtime
-
-        # Never start an unisolated call: a CLI missing any isolation flag
-        # pauses Claude (like a Codex setup problem) until it's updated.
-        try:
-            executable = await asyncio.to_thread(claude_runtime.check_cli)
-        except claude_runtime.ClaudeRuntimeError as e:
-            logger.error(f"Claude call not sent: {e}")
-            await self._mark_unavailable(e)
+        """Generate text exclusively through the configured local Ollama model."""
+        if self.provider != "ollama":
+            logger.error("Refusing non-local inference provider: %s", self.provider)
             return ""
-        if self.unavailable:
-            await self._mark_available()
-
-        # The prompt always travels on stdin: argv is visible to other local
-        # users, Windows caps it at ~32k chars, and .cmd shims re-parse it.
-        cmd = claude_runtime.build_command(executable, self.model, session_id)
-
-        logger.debug(f"Brain call (session={session_id}): {prompt[:100]}...")
-
-        last_error = ""
-        for attempt in range(max_retries + 1):
-            if attempt > 0:
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                logger.info(
-                    f"Retrying brain call in {delay:.0f}s "
-                    f"(attempt {attempt + 1}/{max_retries + 1})..."
-                )
-                await asyncio.sleep(delay)
-
-            process = None
-            try:
-                # The directory outlives the child: it's removed only after
-                # the process has exited (Windows can't delete a live cwd).
-                with claude_runtime.isolated_cwd() as cwd:
-                    process = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        # A fresh empty directory: never the checkout (whose
-                        # CLAUDE.md is the setup wizard) or its ancestors.
-                        cwd=cwd,
-                        env=claude_runtime.runtime_env(cwd),
-                        # A pipe, never the inherited terminal.
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    try:
-                        stdout, stderr = await asyncio.wait_for(
-                            process.communicate(prompt.encode("utf-8")),
-                            timeout=timeout,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.error(
-                            f"Claude call timed out after {timeout:.0f}s. Killing process.")
-                        try:
-                            process.kill()
-                            await process.wait()
-                        except ProcessLookupError:
-                            pass
-                        stdout = None
-                    except BaseException:
-                        # Shutting down: stop and reap the child before its
-                        # directory is removed, then let the cancellation
-                        # through. The reap is bounded so a stuck child can't
-                        # hold shutdown; a second cancel ends it at once.
-                        try:
-                            process.kill()
-                        except ProcessLookupError:
-                            pass
-                        try:
-                            await asyncio.wait_for(process.wait(),
-                                                   timeout=KILL_REAP_SECONDS)
-                        except Exception as e:
-                            logger.warning(f"Claude child not reaped on shutdown: {e!r}")
-                        raise
-                if stdout is None:
-                    last_error = "timeout"
-                    continue  # retry
-
-                if process.returncode != 0:
-                    error = stderr.decode(errors="replace").strip()
-                    logger.error(
-                        f"Claude exited with code {process.returncode}: {error[:300]}"
-                    )
-                    last_error = error
-                    if any(p in error.lower() for p in _NON_RETRYABLE_PATTERNS):
-                        logger.error(
-                            "Non-retryable Claude error (auth). "
-                            "Run 'claude login' and restart Sellbird."
-                        )
-                        return ""
-                    continue  # retry transient failures
-
-                raw = stdout.decode(errors="replace").strip()
-                response, payload = self._parse_result_payload(raw)
-
-                # Usage accounting must never break the response path.
-                try:
-                    await self.state.increment_usage()
-                except Exception as e:
-                    logger.warning(f"Failed to record usage counter: {e}")
-                try:
-                    await self._record_usage(payload, agent=agent, task=task,
-                                             label=session_id or "")
-                except Exception as e:
-                    logger.warning(f"Failed to record usage event: {e}")
-
-                if payload and payload.get("is_error"):
-                    # The CLI reported an API error (overloaded, rate limited)
-                    # inside a successful exit. That text is not the model's
-                    # answer, so no caller may use it as one: retry like any
-                    # other transient failure.
-                    logger.error(f"Claude reported an error: {response[:300]}")
-                    last_error = response
-                    continue
-
-                logger.debug(f"Brain response: {response[:200]}...")
-                return response
-
-            except FileNotFoundError:
-                logger.error(
-                    "Claude CLI not found. Install it: https://code.claude.com/docs/en/setup"
-                )
-                return ""  # not retryable
-            except asyncio.CancelledError:
-                # Shutting down — kill the child so it doesn't orphan
-                if process is not None and process.returncode is None:
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-                raise
-            except Exception as e:
-                logger.error(f"Brain error: {e}")
-                last_error = str(e)
-                continue
-
-        logger.error(
-            f"Brain call failed after {max_retries + 1} attempts. "
-            f"Last error: {str(last_error)[:200]}"
+        return await self._think_ollama(
+            prompt, expect_json=expect_json, timeout=timeout, agent=agent, task=task
         )
-        return ""
-
-    async def _think_codex(
-        self,
-        prompt: str,
-        session_id: str | None,
-        timeout: float,
-        max_retries: int,
-        agent: str,
-        task: str,
-    ) -> str:
-        """One isolated Codex turn per attempt (see sellbird/codex.py)."""
-        from sellbird.codex import CodexError
-
-        paused = self.paused_reason
-        if paused:
-            # Known not to work until the operator acts (or the limit
-            # resets): don't start a runtime per call.
-            logger.debug(f"Codex call skipped: {paused}")
-            return ""
-        logger.debug(f"Brain call via Codex (label={session_id})")
-        last_error = ""
-        for attempt in range(max_retries + 1):
-            if attempt > 0:
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                logger.info(
-                    f"Retrying Codex call in {delay:.0f}s "
-                    f"(attempt {attempt + 1}/{max_retries + 1})..."
-                )
-                await asyncio.sleep(delay)
-            try:
-                result = await self.codex.run(
-                    prompt, timeout=timeout, skip_if=lambda: self.paused_reason)
-            except CodexError as e:
-                if e.kind == "paused":
-                    logger.debug(f"Codex call skipped: {e}")
-                    return ""
-                last_error = str(e)
-                if e.retryable:
-                    logger.warning(f"Codex call failed: {e}")
-                    continue
-                logger.error(f"Codex call failed: {e}")
-                if e.kind in _PERSISTENT_CODEX_KINDS:
-                    await self._mark_unavailable(e)
-                elif e.kind == "usage_limit":
-                    await self._start_usage_pause()
-                    invalidate = getattr(self.quota, "invalidate", None)
-                    if invalidate:
-                        invalidate()
-                return ""
-            except Exception as e:
-                # Not expected (the adapter reports failures as CodexError);
-                # log only the type, since messages could carry call details.
-                # CancelledError is not an Exception, so shutdown propagates.
-                logger.error(f"Codex call failed unexpectedly ({type(e).__name__}).")
-                return ""
-
-            try:
-                await self.state.increment_usage(provider="codex")
-            except Exception as e:
-                logger.warning(f"Failed to record usage counter: {e}")
-            try:
-                await self._record_codex_usage(result, agent=agent, task=task,
-                                               label=session_id or "")
-            except Exception as e:
-                logger.warning(f"Failed to record usage event: {e}")
-            return result.text
-
-        logger.error(
-            f"Codex call failed after {max_retries + 1} attempts. "
-            f"Last error: {last_error[:200]}"
-        )
-        return ""
-
-    async def _record_codex_usage(self, result, agent: str, task: str, label: str):
-        """One usage row per Codex call. ChatGPT plans aren't billed per
-        token, so cost is recorded as 0 rather than estimated."""
-        if not agent and label.startswith("sellbird-"):
-            agent = label[len("sellbird-"):].split("-")[0]
-        await self.state.record_usage_event(
-            agent=agent,
-            task=task or label,
-            session_id=result.thread_id,
-            model=result.model,
-            duration_ms=result.duration_ms,
-            num_turns=1,
-            source="codex_app_server",
-            provider="codex",
-            **result.usage,
-        )
-
-    @staticmethod
-    def _parse_result_payload(raw: str) -> tuple[str, dict | None]:
-        """Split CLI JSON output into (response_text, result_payload).
-
-        With ``--output-format json`` stdout is one JSON object whose
-        ``result`` field is the model's text. If parsing fails (older CLI,
-        truncated output), fall back to treating stdout as plain text so a
-        formatting change can never break Sellbird's pipeline.
-        """
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return raw, None
-        if not isinstance(payload, dict) or payload.get("type") != "result":
-            return raw, None
-        return str(payload.get("result") or ""), payload
-
-    async def _record_usage(
-        self, payload: dict | None, agent: str, task: str, label: str
-    ):
-        """Write per-model usage rows from a CLI result payload."""
-        if not payload:
-            return
-
-        if not agent and label.startswith("sellbird-"):
-            # Callers historically pass labels like "sellbird-scout-score".
-            agent = label[len("sellbird-"):].split("-")[0]
-
-        session = str(payload.get("session_id") or "")
-        duration_ms = int(payload.get("duration_ms") or 0)
-        num_turns = int(payload.get("num_turns") or 0)
-        is_error = bool(payload.get("is_error"))
-
-        # modelUsage includes subagent spend; the flat `usage` field does not.
-        model_usage = payload.get("modelUsage")
-        rows = []
-        if isinstance(model_usage, dict) and model_usage:
-            for model, mu in model_usage.items():
-                if not isinstance(mu, dict):
-                    continue
-                rows.append({
-                    "model": str(model),
-                    "input_tokens": int(mu.get("inputTokens") or 0),
-                    "output_tokens": int(mu.get("outputTokens") or 0),
-                    "cache_read_tokens": int(mu.get("cacheReadInputTokens") or 0),
-                    "cache_creation_tokens": int(mu.get("cacheCreationInputTokens") or 0),
-                    "cost_usd": float(mu.get("costUSD") or 0.0),
-                })
-        else:
-            usage = payload.get("usage")
-            if isinstance(usage, dict):
-                rows.append({
-                    "model": "",
-                    "input_tokens": int(usage.get("input_tokens") or 0),
-                    "output_tokens": int(usage.get("output_tokens") or 0),
-                    "cache_read_tokens": int(usage.get("cache_read_input_tokens") or 0),
-                    "cache_creation_tokens": int(usage.get("cache_creation_input_tokens") or 0),
-                    "cost_usd": float(payload.get("total_cost_usd") or 0.0),
-                })
-
-        for row in rows:
-            await self.state.record_usage_event(
-                agent=agent,
-                task=task or label,
-                session_id=session,
-                duration_ms=duration_ms,
-                num_turns=num_turns,
-                is_error=is_error,
-                source="result_json",
-                provider="claude",
-                **row,
-            )
 
     async def think_json(
         self,
@@ -617,7 +192,7 @@ class Brain:
             + "\n\nRespond ONLY with valid JSON. No markdown, no explanation."
         )
         response = await self.think(
-            full_prompt, session_id=session_id, agent=agent, task=task
+            full_prompt, session_id=session_id, expect_json=True, agent=agent, task=task
         )
         self.last_reply_empty = not response
         if not response:
@@ -664,21 +239,8 @@ class Brain:
     async def is_within_budget(
         self, max_daily_calls: int = 200, max_percent: float | None = None
     ) -> bool:
-        """Check whether Sellbird may spend more of the active subscription.
-
-        Preferred signal: the account's REAL utilization windows (Claude's
-        `/usage` numbers, or Codex's ChatGPT-plan rate limits), compared
-        against max_percent so Sellbird always leaves the remainder for the
-        user's own interactive work. Fallback when those are unavailable:
-        Sellbird's own call counter for this provider against max_daily_calls.
-        """
-        await self._expire_usage_pause()
-        if time.monotonic() < self._usage_limited_until:
-            # Codex said the plan is out of usage: an unreadable quota must
-            # not be mistaken for room to spend.
-            logger.info(f"{self.paused_reason}; waiting for it to reset.")
-            return False
-        if max_percent is not None:
+        """Apply the local daily inference-call limit; no subscription quota is queried."""
+        if max_percent is not None and self.quota is not None:
             try:
                 windows = await self.quota.get_utilization()
             except Exception as e:
@@ -704,20 +266,52 @@ class Brain:
         calls = await self.check_usage()
         return calls < max_daily_calls
 
-    async def _think_transport(self, prompt: str, *, expect_json: bool, timeout: float,
-                               agent: str, task: str) -> str:
-        """One call through ``self.transport``. Never raises."""
-        if self.paused_reason:
-            return ""
+    async def _think_ollama(
+        self, prompt: str, *, expect_json: bool, timeout: float, agent: str, task: str
+    ) -> str:
+        """Run one inference request against the configured local Ollama model."""
+        from sellbird.local_ai.ollama_client import OllamaError
+
+        started = time.monotonic()
         try:
-            text = await asyncio.wait_for(
-                self.transport(prompt, agent=agent, task=task, timeout=timeout,
-                               expect_json=expect_json),
-                timeout=timeout)
-        except Exception as e:  # the transport's failure, or the timeout
-            logger.warning(f"Brain transport call failed ({agent}/{task}): {type(e).__name__}: {e}")
+            response = await asyncio.wait_for(
+                self.ollama.generate(prompt, expect_json=expect_json), timeout=timeout
+            )
+        except asyncio.CancelledError:
+            raise
+        except (OllamaError, asyncio.TimeoutError) as error:
+            logger.error("Local Ollama inference unavailable (%s/%s): %s", agent, task, error)
+            await self._mark_unavailable(error)
             return ""
-        return str(text or "")
+        except Exception as error:
+            logger.error("Local Ollama inference failed (%s/%s): %s", agent, task, type(error).__name__)
+            await self._mark_unavailable(error)
+            return ""
+
+        if self.unavailable:
+            await self._mark_available()
+        duration_ms = int((time.monotonic() - started) * 1000)
+        try:
+            await self.state.increment_usage(provider="ollama")
+        except Exception as error:
+            logger.warning("Failed to record local inference counter: %s", error)
+        try:
+            await self.state.record_usage_event(
+                agent=agent,
+                task=task,
+                model=self.model,
+                duration_ms=duration_ms,
+                is_error=False,
+                source="ollama_local",
+                provider="ollama",
+            )
+        except Exception as error:
+            logger.warning("Failed to record local inference event: %s", error)
+        logger.info(
+            "LOCAL INFERENCE completed provider=ollama model=%s agent=%s task=%s duration_ms=%s",
+            self.model, agent, task, duration_ms,
+        )
+        return response
 
     def load_prompt(self, prompt_name: str, **kwargs) -> str:
         """Load a prompt template from the prompts/ directory and fill in variables."""
@@ -731,7 +325,7 @@ class Brain:
             return ""
         for key, value in kwargs.items():
             template = template.replace(f"{{{{{key}}}}}", str(value))
-        # Surface templating mistakes early instead of sending {{foo}} to Claude
+        # Surface templating mistakes early instead of sending {{foo}} to the model
         leftover = re.findall(r"\{\{(\w+)\}\}", template)
         if leftover:
             logger.warning(
