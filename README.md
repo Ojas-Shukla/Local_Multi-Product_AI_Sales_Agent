@@ -176,6 +176,7 @@ database, the logs and the dashboard token.
 | [Configuration and commands](docs/configuration.md) | `.env`, `sellbird.yaml` and every command |
 | [Extensions](docs/extensions.md) | Adding routes, heartbeat steps and commands from a separate package |
 | [Local AI](docs/local-ai.md) | Ollama setup, model configuration, and local-only inference behavior |
+| [Offline acceptance](docs/OFFLINE_ACCEPTANCE.md) | Manual eight-workflow test with internet disconnected |
 | [Legal and deliverability](docs/deliverability.md) | The rules you're sending under, and warmup |
 | [Microsoft 365](docs/microsoft365.md) · [Precleared](docs/precleared.md) | Provider setup guides |
 | [Docker](docs/docker.md) · [Troubleshooting](docs/troubleshooting.md) · [Roadmap](docs/roadmap.md) | Running, fixing and what's next |
