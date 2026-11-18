@@ -26,9 +26,14 @@ async def classify_buying_signals(brain, state, prospect_id: str, product_id: st
     if product_id and not product:
         raise ValueError("Selected product was not found. Refresh the product list and retry.")
 
-    saved_research = await state.get_prospect_research(prospect_id) if hasattr(state, "get_prospect_research") else None
-    # Prospect research is stored as the latest product-specific run. Never
-    # mix it into a different product's buying-signal classification.
+    if hasattr(state, "get_prospect_research"):
+        try:
+            saved_research = await state.get_prospect_research(prospect_id, product_id)
+        except TypeError:  # compatibility with lightweight adapters exposing the older signature
+            saved_research = await state.get_prospect_research(prospect_id)
+    else:
+        saved_research = None
+    # Never mix research generated for another product/ICP into this analysis.
     if saved_research and (saved_research.get("product_id") or "") == (product_id or ""):
         research_context = saved_research.get("research", {})
     else:

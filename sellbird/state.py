@@ -663,6 +663,27 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_prospect_ai_scores_updated
         ON prospect_ai_scores(updated_at);
     """,
+    # ── v21: keep prospect research independently for every product/ICP ──
+    """
+    CREATE TABLE prospect_research_v21_tmp (
+        prospect_id TEXT NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+        product_id TEXT NOT NULL DEFAULT '',
+        research_json TEXT NOT NULL,
+        model TEXT DEFAULT '',
+        provider TEXT DEFAULT 'ollama_local',
+        source_count INTEGER DEFAULT 0,
+        generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (prospect_id, product_id)
+    );
+    INSERT INTO prospect_research_v21_tmp
+        (prospect_id, product_id, research_json, model, provider, source_count, generated_at, updated_at)
+    SELECT prospect_id, COALESCE(product_id, ''), research_json, model, provider, source_count, generated_at, updated_at
+    FROM prospect_research;
+    DROP TABLE prospect_research;
+    ALTER TABLE prospect_research_v21_tmp RENAME TO prospect_research;
+    CREATE INDEX idx_prospect_research_updated ON prospect_research(updated_at);
+    """,
 ]
 
 BRAIN_PROVIDERS = ("ollama",)
@@ -2324,21 +2345,27 @@ class StateManager:
                    (prospect_id, product_id, research_json, model, provider, source_count,
                     generated_at, updated_at)
                    VALUES (?, ?, ?, ?, 'ollama_local', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                   ON CONFLICT(prospect_id) DO UPDATE SET
-                     product_id=excluded.product_id, research_json=excluded.research_json,
-                     model=excluded.model, provider='ollama_local',
-                     source_count=excluded.source_count, generated_at=CURRENT_TIMESTAMP,
-                     updated_at=CURRENT_TIMESTAMP""",
+                   ON CONFLICT(prospect_id, product_id) DO UPDATE SET
+                     research_json=excluded.research_json, model=excluded.model,
+                     provider='ollama_local', source_count=excluded.source_count,
+                     generated_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP""",
                 (prospect_id, product_id or '', payload, model or '', int(source_count)),
             )
             await db.commit()
 
-    async def get_prospect_research(self, prospect_id: str) -> dict | None:
+    async def get_prospect_research(self, prospect_id: str,
+                                    product_id: str | None = None) -> dict | None:
+        """Get one product's research, or the latest record when product is omitted."""
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM prospect_research WHERE prospect_id = ?", (prospect_id,)
-            ) as cursor:
+            if product_id is None:
+                query = ("SELECT * FROM prospect_research WHERE prospect_id = "
+                         "? ORDER BY updated_at DESC LIMIT 1")
+                params = (prospect_id,)
+            else:
+                query = "SELECT * FROM prospect_research WHERE prospect_id = ? AND product_id = ?"
+                params = (prospect_id, product_id or '')
+            async with db.execute(query, params) as cursor:
                 row = await cursor.fetchone()
         if not row:
             return None

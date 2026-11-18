@@ -19,12 +19,17 @@ async def _context(state, prospect_id: str, product_id: str = ""):
     product = next((p for p in products if p.get("id") == product_id), None) if product_id else None
     if product_id and not product:
         raise ValueError("Selected product was not found. Refresh the product list and retry.")
-    research_row = await state.get_prospect_research(prospect_id)
+    try:
+        research_row = await state.get_prospect_research(prospect_id, product_id)
+    except TypeError:  # compatibility with lightweight adapters exposing the older signature
+        research_row = await state.get_prospect_research(prospect_id)
     research = (research_row or {}).get("research", {})
     if research_row and (research_row.get("product_id") or "") != (product_id or ""):
         research = {}
     signal_row = await state.get_buying_signal_classification(prospect_id, product_id)
-    signals = (signal_row or {}).get("classification", {})
+    # StateManager returns the persisted JSON under ``payload``; retain the
+    # legacy ``classification`` shape for lightweight adapters and tests.
+    signals = (signal_row or {}).get("payload") or (signal_row or {}).get("classification", {})
     company = await state.get_company(prospect.company_id) if prospect.company_id else None
     context = {
         "prospect": {"first_name": prospect.first_name, "last_name": prospect.last_name,

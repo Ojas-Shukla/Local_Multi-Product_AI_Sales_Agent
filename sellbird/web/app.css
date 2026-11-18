@@ -1031,6 +1031,27 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .optout-panel .convo-actions .muted { white-space: normal; }
 .optout-panel .convo-actions .btn-ghost { margin-left: 0; }
 
+/* Contacts: complete product-specific local AI workflow. */
+.prospect-workflow { max-width: 100%; }
+.workflow-heading { align-items: end; justify-content: space-between; flex-wrap: wrap; }
+.workflow-heading > div { min-width: 220px; }
+.workflow-product { display: flex; flex-direction: column; gap: 5px; min-width: 220px; }
+.workflow-product .form-label { margin: 0; }
+.workflow-step { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3) 0; border-top: 1px solid var(--line); }
+.workflow-step-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); flex-wrap: wrap; }
+.workflow-step h4 { margin: 0; }
+.workflow-step p { margin: 0; line-height: 1.55; }
+.workflow-step ul { margin: 0; padding-left: 22px; }
+.workflow-step li { margin: 3px 0; }
+.workflow-score strong { font-size: 22px; }
+.workflow-email-body { white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--sp-2); border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); }
+.prospect-workflow textarea { width: 100%; resize: vertical; }
+@media (max-width: 720px) {
+  .workflow-heading, .workflow-step-head { align-items: stretch; }
+  .workflow-product { width: 100%; }
+  .workflow-step-head .btn { align-self: flex-start; }
+}
+
 /* Outbox: an email autopilot held for you (#66). */
 .desk-held { margin-bottom: var(--sp-3); }
 

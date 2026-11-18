@@ -2258,12 +2258,12 @@ function renderContacts() {
         ? '<button class="btn btn-ghost btn-sm" onclick="toggleOptOut(' + i + ')" ' +
           'aria-expanded="' + (_optOut.id === p.id) + '" title="What made Sellbird stop emailing them">' +
           (p.status === 'opted_out' ? 'Why?' : 'Opt-out history') + '</button>' : '') +
-        '<button class="btn btn-ghost btn-sm row-action" onclick="toggleProspectResearch(' + i + ')" ' +
-        'title="Research using previously downloaded local data">Research</button>' +
+        '<button class="btn btn-ghost btn-sm row-action" onclick="toggleProspectWorkflow(' + i + ')" ' +
+        'title="Open the product-specific local AI workflow">AI workflow</button>' +
         '<button class="btn btn-ghost btn-sm row-action" onclick="fbProspect(' + i + ')" ' +
         'title="Leave feedback on this contact">Feedback</button></div></td></tr>';
     if (_optOut.id === p.id) html += '<tr class="detail-row"><td colspan="8">' + optOutPanel(p) + '</td></tr>';
-    if (_prospectResearch.id === p.id) html += '<tr class="detail-row"><td colspan="8">' + prospectResearchPanel(p) + '</td></tr>';
+    if (_prospectWorkflow.id === p.id) html += '<tr class="detail-row"><td colspan="8">' + prospectWorkflowPanel(p) + '</td></tr>';
   }
   rowsEl.innerHTML = html + '</tbody></table></div>' +
     '<div class="table-foot">' + rows.length + ' of ' + _prospects.length + ' contacts</div>';
@@ -2318,15 +2318,218 @@ function prospectResearchPanel(p) {
   return html;
 }
 async function runProspectResearch(prospectId) {
-  _prospectResearch = {id: prospectId, data: null, loading: true}; renderContacts();
   const productSelect = document.getElementById('research-product-' + prospectId);
   const productId = productSelect ? productSelect.value : '';
+  _prospectResearch = {id: prospectId, data: null, loading: true}; renderContacts();
   const data = await api('/api/prospects/' + encodeURIComponent(prospectId) + '/research', {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({product_id: productId})
   });
   if (_prospectResearch.id !== prospectId) return;
   _prospectResearch = {id: prospectId, data: data && data.research ? data.research : null, loading: false};
   if (!data || !data.success) showToast((data && data.message) || 'Could not generate local research.', 'error');
+  renderContacts();
+}
+
+// One Contacts workspace for the complete product-specific local AI workflow.
+// Every result is loaded from / persisted by the existing SQLite-backed API.
+let _prospectWorkflow = {
+  id: null, productId: '', products: [], loading: '',
+  data: {research: null, buying: null, problem: null, score: null, draft: null, reply: null},
+  replyText: '',
+};
+const WORKFLOW_ENDPOINTS = {
+  research: ['research', 'research'],
+  buying: ['buying-signals', 'classification'],
+  problem: ['problem-statement', 'problem_statement'],
+  score: ['score', 'score'],
+  draft: ['personalised-email', 'draft'],
+  reply: ['reply-classification', 'classification'],
+};
+
+function workflowUrl(prospectId, action, productId) {
+  const [path] = WORKFLOW_ENDPOINTS[action];
+  return '/api/prospects/' + encodeURIComponent(prospectId) + '/' + path +
+    '?product_id=' + encodeURIComponent(productId || '');
+}
+
+async function toggleProspectWorkflow(i) {
+  const p = _prospects[i];
+  if (!p) return;
+  if (_prospectWorkflow.id === p.id) {
+    _prospectWorkflow = {..._prospectWorkflow, id: null, loading: ''};
+    renderContacts();
+    return;
+  }
+  _prospectWorkflow = {
+    id: p.id, productId: '', products: [], loading: 'load',
+    data: {research: null, buying: null, problem: null, score: null, draft: null, reply: null},
+    replyText: '',
+  };
+  renderContacts();
+  const productsData = await api('/api/sales/products');
+  if (_prospectWorkflow.id !== p.id) return;
+  _prospectWorkflow.products = productsData && Array.isArray(productsData.products)
+    ? productsData.products : [];
+  await loadProspectWorkflowData(p.id);
+}
+
+async function loadProspectWorkflowData(prospectId) {
+  const productId = _prospectWorkflow.productId || '';
+  _prospectWorkflow.loading = 'load';
+  renderContacts();
+  const keys = Object.keys(WORKFLOW_ENDPOINTS);
+  const results = await Promise.all(keys.map(key => api(workflowUrl(prospectId, key, productId))));
+  if (_prospectWorkflow.id !== prospectId || _prospectWorkflow.productId !== productId) return;
+  const next = {};
+  keys.forEach((key, index) => {
+    const [, field] = WORKFLOW_ENDPOINTS[key];
+    let value = results[index] && results[index][field] ? results[index][field] : null;
+    // Prospect research has a legacy row wrapper and is stored as the latest
+    // product run only; unwrap it and never show a different product's result.
+    if (key === 'research' && value) {
+      if ((value.product_id || '') !== productId) value = null;
+      else if (value.research && typeof value.research === 'object') value = value.research;
+    }
+    next[key] = value;
+  });
+  _prospectWorkflow.data = next;
+  _prospectWorkflow.loading = '';
+  renderContacts();
+}
+
+async function changeProspectWorkflowProduct(prospectId, productId) {
+  if (_prospectWorkflow.id !== prospectId) return;
+  _prospectWorkflow.productId = productId || '';
+  _prospectWorkflow.data = {research: null, buying: null, problem: null, score: null, draft: null, reply: null};
+  await loadProspectWorkflowData(prospectId);
+}
+
+function workflowList(items) {
+  if (!Array.isArray(items) || !items.length) return '<p class="muted">No information available.</p>';
+  return '<ul>' + items.map(item => {
+    if (item && typeof item === 'object') {
+      const fact = item.fact || item.name || item.type || '';
+      const extra = item.source_context || item.evidence || item.rationale || '';
+      return '<li>' + escHtml(fact) + (extra ? ' — ' + escHtml(extra) : '') + '</li>';
+    }
+    return '<li>' + escHtml(item) + '</li>';
+  }).join('') + '</ul>';
+}
+
+function workflowMeta(d) {
+  if (!d) return '';
+  return '<p class="optout-meta">' + escHtml(d.provider || 'ollama_local') + ' · ' +
+    escHtml(d.model || 'local model') + (d.confidence ? ' · Confidence: ' + escHtml(d.confidence) : '') +
+    (d.generated_at ? ' · ' + escHtml(relTime(d.generated_at)) : '') + '</p>';
+}
+
+function workflowResult(title, d, content) {
+  return '<section class="workflow-result"><h4>' + title + '</h4>' +
+    (d ? content + workflowMeta(d) : '<p class="muted">No saved result for this product yet. Run this step to generate it locally.</p>') +
+    '</section>';
+}
+
+function prospectWorkflowPanel(p) {
+  const w = _prospectWorkflow;
+  if (w.loading === 'load') return '<div class="optout-panel muted">Loading saved product-specific AI results…</div>';
+  const d = w.data || {};
+  const busy = !!w.loading;
+  const productOptions = '<option value="">No product selected</option>' + w.products.map(prod =>
+    '<option value="' + escHtml(prod.id) + '"' + (w.productId === prod.id ? ' selected' : '') + '>' +
+    escHtml(prod.name) + '</option>').join('');
+  const actionButton = (key, label) => '<button class="btn btn-secondary btn-sm" ' +
+    (busy ? 'disabled ' : '') + 'onclick="runProspectWorkflow(' + jsq(p.id) + ',' + jsq(key) + ')">' +
+    (w.loading === key ? 'Working…' : label) + '</button>';
+
+  let html = '<div class="optout-panel prospect-workflow"><div class="cell-row workflow-heading">' +
+    '<div><b>Local AI sales workflow</b><p class="optout-meta">All inference runs through local Ollama. Results are saved in this application.</p></div>' +
+    '<label class="workflow-product"><span class="form-label">Product / ICP context</span>' +
+    '<select class="form-input" aria-label="Select product for AI workflow" onchange="changeProspectWorkflowProduct(' +
+    jsq(p.id) + ',this.value)">' + productOptions + '</select></label></div>';
+
+  html += '<div class="workflow-step"><div class="workflow-step-head"><b>1. Prospect research</b>' + actionButton('research', 'Generate research') + '</div>' +
+    (d.research ? '<p>' + escHtml(d.research.company_overview || '') + '</p><p>' + escHtml(d.research.contact_context || '') + '</p>' +
+      '<b>Relevant facts</b>' + workflowList(d.research.relevant_facts) + '<b>Potential relevance</b>' + workflowList(d.research.potential_relevance) +
+      '<b>Research gaps</b>' + workflowList(d.research.research_gaps) + '<b>Suggested questions</b>' + workflowList(d.research.suggested_research_questions) +
+      '<p><b>Product fit:</b> ' + escHtml(d.research.product_fit || '') + '</p>' + workflowMeta(d.research)
+      : '<p class="muted">Use information already downloaded into the local database; this step does not fetch websites.</p>') + '</div>';
+
+  html += '<div class="workflow-step"><div class="workflow-step-head"><b>2. Buying signals</b>' + actionButton('buying', 'Classify signals') + '</div>' +
+    (d.buying ? '<p><b>' + escHtml(d.buying.overall_strength || 'unknown') + '</b> · Stage: ' + escHtml(d.buying.buying_stage || 'unknown') +
+      ' · Urgency: ' + escHtml(d.buying.urgency || 'unknown') + '</p>' +
+      (Array.isArray(d.buying.signals) ? '<ul>' + d.buying.signals.map(x => '<li><b>' + escHtml(x.type) + '</b> (' + escHtml(x.strength) + '): ' +
+        escHtml(x.evidence) + (x.evidence_date ? ' · ' + escHtml(x.evidence_date) : '') + '</li>').join('') + '</ul>' : '') +
+      '<p>' + escHtml(d.buying.product_relevance || '') + '</p><p><b>Next action:</b> ' + escHtml(d.buying.recommended_next_action || '') + '</p>' +
+      '<b>Evidence gaps</b>' + workflowList(d.buying.evidence_gaps) + workflowMeta(d.buying)
+      : '<p class="muted">Classify only signals supported by previously downloaded local evidence.</p>') + '</div>';
+
+  html += '<div class="workflow-step"><div class="workflow-step-head"><b>3. Problem statement</b>' + actionButton('problem', 'Generate problem statement') + '</div>' +
+    (d.problem ? '<p>' + escHtml(d.problem.problem_statement || '') + '</p><p><b>Hypothesis:</b> ' + escHtml(d.problem.hypothesis || '') + '</p>' +
+      '<p><b>Product relevance:</b> ' + escHtml(d.problem.product_relevance || '') + '</p><b>Supporting evidence</b>' + workflowList(d.problem.supporting_evidence) +
+      '<b>Discovery questions</b>' + workflowList(d.problem.discovery_questions) + '<b>Evidence gaps</b>' + workflowList(d.problem.evidence_gaps) + workflowMeta(d.problem)
+      : '<p class="muted">Generate an evidence-aware problem hypothesis and discovery questions.</p>') + '</div>';
+
+  html += '<div class="workflow-step"><div class="workflow-step-head"><b>4. AI prospect score</b>' + actionButton('score', 'Score prospect') + '</div>' +
+    (d.score ? '<p class="workflow-score"><strong>' + escHtml(d.score.score) + '/100</strong> · ' + escHtml(d.score.tier || '') + '</p>' +
+      '<p>' + escHtml(d.score.summary || '') + '</p><b>Scoring factors</b>' + workflowList(d.score.factors) +
+      '<b>Disqualifiers</b>' + workflowList(d.score.disqualifiers) + '<b>Evidence gaps</b>' + workflowList(d.score.evidence_gaps) + workflowMeta(d.score)
+      : '<p class="muted">Score this prospect against the selected product’s ICP. This does not overwrite the existing Scout score.</p>') + '</div>';
+
+  html += '<div class="workflow-step"><div class="workflow-step-head"><b>5. Personalised email</b>' + actionButton('draft', 'Generate email draft') + '</div>' +
+    (d.draft ? '<p><b>Subject:</b> ' + escHtml(d.draft.subject || '') + '</p><div class="workflow-email-body">' + escHtml(d.draft.body || '') + '</div>' +
+      '<b>Personalisation basis</b>' + workflowList(d.draft.personalization_basis) + '<b>Evidence gaps</b>' + workflowList(d.draft.evidence_gaps) +
+      '<p class="optout-meta">Draft only · Not sent · ' + escHtml(d.draft.model || 'local model') + '</p>'
+      : '<p class="muted">Generate a draft only. Sellbird will not send it automatically.</p>') + '</div>';
+
+  html += '<div class="workflow-step"><div class="workflow-step-head"><b>6. Reply classification</b>' + actionButton('reply', 'Classify sample reply') + '</div>' +
+    '<label class="form-label" for="workflow-reply-' + escHtml(p.id) + '">Paste a sample conversation or latest reply</label>' +
+    '<textarea class="form-input" rows="4" maxlength="12000" id="workflow-reply-' + escHtml(p.id) + '" ' +
+    'placeholder="Paste the prospect conversation here…" oninput="setProspectWorkflowReply(' + jsq(p.id) + ',this.value)">' +
+    escHtml(w.replyText || (d.reply && d.reply.conversation_text) || '') + '</textarea>' +
+    (d.reply ? '<p><b>Intent:</b> ' + escHtml(d.reply.intent) + ' · <b>Sentiment:</b> ' + escHtml(d.reply.sentiment) +
+      ' · <b>Readiness:</b> ' + escHtml(d.reply.buying_readiness) + '</p><p>' + escHtml(d.reply.summary || '') + '</p>' +
+      '<p><b>Recommended next action:</b> ' + escHtml(d.reply.recommended_next_action || '') + '</p>' +
+      '<b>Key points</b>' + workflowList(d.reply.key_points) +
+      (d.reply.suggested_response ? '<b>Suggested response draft</b><div class="workflow-email-body">' + escHtml(d.reply.suggested_response) + '</div>' : '') + workflowMeta(d.reply)
+      : '<p class="muted">Classification uses only the conversation you paste and local prospect context. It does not send a response.</p>') + '</div>';
+
+  if (busy) html += '<p class="optout-meta">Running ' + escHtml(w.loading) + ' with local Ollama…</p>';
+  html += '</div>';
+  return html;
+}
+
+function setProspectWorkflowReply(prospectId, value) {
+  if (_prospectWorkflow.id === prospectId) _prospectWorkflow.replyText = String(value || '').slice(0, 12000);
+}
+
+async function runProspectWorkflow(prospectId, action) {
+  if (_prospectWorkflow.id !== prospectId || !WORKFLOW_ENDPOINTS[action]) return;
+  const productId = _prospectWorkflow.productId || '';
+  const conversationText = _prospectWorkflow.replyText ||
+    (document.getElementById('workflow-reply-' + prospectId) || {}).value || '';
+  if (action === 'reply' && conversationText.trim().length < 3) {
+    showToast('Paste a sample conversation before classifying the reply.', 'error');
+    return;
+  }
+  _prospectWorkflow.loading = action;
+  renderContacts();
+  const [path] = WORKFLOW_ENDPOINTS[action];
+  const body = {product_id: productId};
+  if (action === 'reply') body.conversation_text = conversationText;
+  const result = await api('/api/prospects/' + encodeURIComponent(prospectId) + '/' + path, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+  });
+  if (_prospectWorkflow.id !== prospectId || _prospectWorkflow.productId !== productId) return;
+  _prospectWorkflow.loading = '';
+  if (!result || !result.success) {
+    showToast(failMsg(result, 'Could not complete the local AI workflow step.'), 'error');
+    renderContacts();
+    return;
+  }
+  const [, field] = WORKFLOW_ENDPOINTS[action];
+  _prospectWorkflow.data[action] = result[field] || null;
+  if (action === 'reply') _prospectWorkflow.replyText = conversationText;
+  showToast(action === 'draft' ? 'Email draft generated — not sent.' : 'Local AI result saved.', 'success');
   renderContacts();
 }
 

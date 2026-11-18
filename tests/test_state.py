@@ -158,3 +158,20 @@ async def test_product_specific_ai_records_persist_and_upsert(state):
         prospect_id, "product-a", {"score": 82, "tier": "high_priority"}, "qwen3:1.7b",
     )
     assert (await state.get_prospect_ai_score(prospect_id, "product-a"))["payload"]["score"] == 82
+
+
+@pytest.mark.asyncio
+async def test_prospect_research_is_persisted_per_product(state):
+    prospect_id = await state.add_prospect(Prospect(
+        first_name="Ada", last_name="Lovelace", email="ada@research.test", title="COO",
+    ))
+    await state.save_prospect_research(
+        prospect_id, "product-a", {"company_overview": "Research for A"}, "qwen3:1.7b", 2,
+    )
+    await state.save_prospect_research(
+        prospect_id, "product-b", {"company_overview": "Research for B"}, "qwen3:1.7b", 3,
+    )
+    product_a = await state.get_prospect_research(prospect_id, "product-a")
+    product_b = await state.get_prospect_research(prospect_id, "product-b")
+    assert product_a["research"]["company_overview"] == "Research for A"
+    assert product_b["research"]["company_overview"] == "Research for B"

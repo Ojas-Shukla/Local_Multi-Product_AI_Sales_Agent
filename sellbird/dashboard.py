@@ -1303,13 +1303,13 @@ async def get_usage():
 
 
 @app.get("/api/prospects/{prospect_id}/research")
-async def get_prospect_research(prospect_id: str):
-    """Return the latest locally generated research for a saved prospect."""
+async def get_prospect_research(prospect_id: str, product_id: str | None = None):
+    """Return saved local research, optionally scoped to one product/ICP."""
     state = _state()
     await state.init_db()
     if not await state.get_prospect(prospect_id):
         return JSONResponse({"success": False, "message": "Prospect not found."}, status_code=404)
-    return {"success": True, "research": await state.get_prospect_research(prospect_id)}
+    return {"success": True, "research": await state.get_prospect_research(prospect_id, product_id[:40] if product_id is not None else None)}
 
 
 @app.post("/api/prospects/{prospect_id}/research")
@@ -1326,6 +1326,140 @@ async def generate_prospect_research_route(prospect_id: str, request: Request):
         return JSONResponse({"success": False, "message": str(error)}, status_code=400)
     except Exception as error:
         logger.warning("Local prospect research failed prospect=%s: %s", prospect_id, error)
+        return JSONResponse({"success": False, "message": str(error)}, status_code=503)
+
+
+@app.get("/api/prospects/{prospect_id}/buying-signals")
+async def get_prospect_buying_signals(prospect_id: str, product_id: str = ""):
+    state = _state()
+    await state.init_db()
+    if not await state.get_prospect(prospect_id):
+        return JSONResponse({"success": False, "message": "Prospect not found."}, status_code=404)
+    result = await state.get_buying_signal_classification(prospect_id, product_id[:40])
+    return {"success": True, "classification": (result or {}).get("payload") if result else None}
+
+
+@app.post("/api/prospects/{prospect_id}/buying-signals")
+async def classify_prospect_buying_signals(prospect_id: str, request: Request):
+    from sellbird.buying_signals import classify_buying_signals
+    try:
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        product_id = str((body or {}).get("product_id") or "")[:40]
+        brain, state, _config = await _offer_brain()
+        result = await classify_buying_signals(brain, state, prospect_id, product_id)
+        return {"success": True, "classification": result}
+    except ValueError as error:
+        return JSONResponse({"success": False, "message": str(error)}, status_code=400)
+    except Exception as error:
+        logger.warning("Local buying-signal classification failed prospect=%s: %s", prospect_id, error)
+        return JSONResponse({"success": False, "message": str(error)}, status_code=503)
+
+
+@app.get("/api/prospects/{prospect_id}/problem-statement")
+async def get_prospect_problem_statement(prospect_id: str, product_id: str = ""):
+    state = _state()
+    await state.init_db()
+    if not await state.get_prospect(prospect_id):
+        return JSONResponse({"success": False, "message": "Prospect not found."}, status_code=404)
+    result = await state.get_problem_statement(prospect_id, product_id[:40])
+    return {"success": True, "problem_statement": (result or {}).get("payload") if result else None}
+
+
+@app.post("/api/prospects/{prospect_id}/problem-statement")
+async def generate_prospect_problem_statement(prospect_id: str, request: Request):
+    from sellbird.prospect_intelligence import generate_problem_statement
+    try:
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        product_id = str((body or {}).get("product_id") or "")[:40]
+        brain, state, _config = await _offer_brain()
+        result = await generate_problem_statement(brain, state, prospect_id, product_id)
+        return {"success": True, "problem_statement": result}
+    except ValueError as error:
+        return JSONResponse({"success": False, "message": str(error)}, status_code=400)
+    except Exception as error:
+        logger.warning("Local problem-statement generation failed prospect=%s: %s", prospect_id, error)
+        return JSONResponse({"success": False, "message": str(error)}, status_code=503)
+
+
+@app.get("/api/prospects/{prospect_id}/score")
+async def get_prospect_ai_score(prospect_id: str, product_id: str = ""):
+    state = _state()
+    await state.init_db()
+    if not await state.get_prospect(prospect_id):
+        return JSONResponse({"success": False, "message": "Prospect not found."}, status_code=404)
+    result = await state.get_prospect_ai_score(prospect_id, product_id[:40])
+    return {"success": True, "score": (result or {}).get("payload") if result else None}
+
+
+@app.post("/api/prospects/{prospect_id}/score")
+async def score_prospect_route(prospect_id: str, request: Request):
+    from sellbird.prospect_intelligence import score_prospect
+    try:
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        product_id = str((body or {}).get("product_id") or "")[:40]
+        brain, state, _config = await _offer_brain()
+        result = await score_prospect(brain, state, prospect_id, product_id)
+        return {"success": True, "score": result}
+    except ValueError as error:
+        return JSONResponse({"success": False, "message": str(error)}, status_code=400)
+    except Exception as error:
+        logger.warning("Local prospect scoring failed prospect=%s: %s", prospect_id, error)
+        return JSONResponse({"success": False, "message": str(error)}, status_code=503)
+
+
+@app.get("/api/prospects/{prospect_id}/personalised-email")
+async def get_prospect_personalised_email(prospect_id: str, product_id: str = ""):
+    state = _state()
+    await state.init_db()
+    if not await state.get_prospect(prospect_id):
+        return JSONResponse({"success": False, "message": "Prospect not found."}, status_code=404)
+    result = await state.get_personalised_email(prospect_id, product_id[:40])
+    return {"success": True, "draft": (result or {}).get("payload") if result else None}
+
+
+@app.post("/api/prospects/{prospect_id}/personalised-email")
+async def generate_prospect_personalised_email(prospect_id: str, request: Request):
+    from sellbird.outreach import generate_personalised_email
+    try:
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        product_id = str((body or {}).get("product_id") or "")[:40]
+        brain, state, _config = await _offer_brain()
+        result = await generate_personalised_email(brain, state, prospect_id, product_id)
+        return {"success": True, "draft": result}
+    except ValueError as error:
+        return JSONResponse({"success": False, "message": str(error)}, status_code=400)
+    except Exception as error:
+        logger.warning("Local personalised email generation failed prospect=%s: %s", prospect_id, error)
+        return JSONResponse({"success": False, "message": str(error)}, status_code=503)
+
+
+@app.get("/api/prospects/{prospect_id}/reply-classification")
+async def get_prospect_reply_classification(prospect_id: str, product_id: str = ""):
+    state = _state()
+    await state.init_db()
+    if not await state.get_prospect(prospect_id):
+        return JSONResponse({"success": False, "message": "Prospect not found."}, status_code=404)
+    result = await state.get_reply_classification(prospect_id, product_id[:40])
+    return {"success": True, "classification": (result or {}).get("payload") if result else None}
+
+
+@app.post("/api/prospects/{prospect_id}/reply-classification")
+async def classify_prospect_reply_route(prospect_id: str, request: Request):
+    from sellbird.outreach import classify_prospect_reply
+    try:
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        body = body if isinstance(body, dict) else {}
+        product_id = str(body.get("product_id") or "")[:40]
+        conversation_text = str(body.get("conversation_text") or "")[:12000]
+        brain, state, _config = await _offer_brain()
+        result = await classify_prospect_reply(
+            brain, state, prospect_id, conversation_text, product_id,
+        )
+        return {"success": True, "classification": result}
+    except ValueError as error:
+        return JSONResponse({"success": False, "message": str(error)}, status_code=400)
+    except Exception as error:
+        logger.warning("Local reply classification failed prospect=%s: %s", prospect_id, error)
         return JSONResponse({"success": False, "message": str(error)}, status_code=503)
 
 
