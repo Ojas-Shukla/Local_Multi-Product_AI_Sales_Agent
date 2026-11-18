@@ -105,37 +105,31 @@ SAMPLE_RESULT = {
 }
 
 
-def test_parse_result_payload_json():
-    text, payload = Brain._parse_result_payload(json.dumps(SAMPLE_RESULT))
-    assert text == "Hello from Claude"
-    assert payload["session_id"] == "f362e409-925c-4eb1-ba98-60484bb2dcf5"
-
-
-def test_parse_result_payload_plain_text_fallback():
-    text, payload = Brain._parse_result_payload("just plain text output")
-    assert text == "just plain text output"
-    assert payload is None
-    # A JSON response body that isn't a CLI result envelope stays verbatim
-    text2, payload2 = Brain._parse_result_payload('{"intent": "interested"}')
-    assert text2 == '{"intent": "interested"}'
-    assert payload2 is None
-
-
 @pytest.mark.asyncio
-async def test_brain_records_usage_from_payload(state):
+async def test_brain_records_local_ollama_usage(state):
     brain = Brain(state)
-    await brain._record_usage(
-        SAMPLE_RESULT, agent="", task="", label="sellbird-scout-score"
+
+    async def fake_generate(prompt, *, expect_json=False):
+        return "Local Qwen response"
+
+    brain.ollama.generate = fake_generate
+
+    response = await brain.think(
+        "Test local inference",
+        agent="scout",
+        task="score",
     )
+
+    assert response == "Local Qwen response"
+    assert await state.get_usage_today(provider="ollama") == 1
+
     rows = await state.usage_by_agent(days=1)
     assert len(rows) == 1
-    assert rows[0]["agent"] == "scout"  # derived from the sellbird-* label
-    assert rows[0]["output_tokens"] == 51
-    assert rows[0]["cost_usd"] == pytest.approx(0.0182948, abs=1e-4)
+    assert rows[0]["agent"] == "scout"
+    assert rows[0]["calls"] == 1
 
-    by_model = await state.usage_by_model(days=1)
-    assert by_model[0]["model"] == "claude-haiku-4-5-20251001"
-
+    models = await state.usage_by_model(days=1)
+    assert models[0]["model"] == "qwen3:1.7b"
 
 @pytest.mark.asyncio
 async def test_usage_is_sellbird_only(state):

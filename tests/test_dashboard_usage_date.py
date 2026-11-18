@@ -19,9 +19,11 @@ def test_stats_use_local_day_when_sqlite_utc_day_differs(client, monkeypatch, of
         utc_day = date.fromisoformat(db.execute("SELECT date('now')").fetchone()[0])
         local_day = utc_day + timedelta(days=offset)
         db.executemany(
-            "INSERT INTO usage_log (id, date, claude_calls, codex_calls) VALUES (?, ?, ?, ?)",
-            [("utc", utc_day.isoformat(), 91, 92),
-             ("local", local_day.isoformat(), 3, 7)],
+            "INSERT INTO usage_log (id, date, ollama_calls) VALUES (?, ?, ?)",
+            [
+                ("utc", utc_day.isoformat(), 91),
+                ("local", local_day.isoformat(), 3),
+            ],
         )
 
     class LocalDate(date):
@@ -33,5 +35,4 @@ def test_stats_use_local_day_when_sqlite_utc_day_differs(client, monkeypatch, of
     response = client.get("/api/stats")
     assert response.status_code == 200
     stats = response.json()
-    assert stats["claude_calls_today"] == 3
-    assert stats["codex_calls_today"] == 7
+    assert stats["ollama_calls_today"] == 3

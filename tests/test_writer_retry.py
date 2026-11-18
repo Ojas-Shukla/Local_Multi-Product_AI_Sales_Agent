@@ -172,28 +172,29 @@ class _ClaudeProcess:
 
 
 @pytest.mark.asyncio
-async def test_a_cli_reported_api_error_is_no_reply_not_model_text(state, monkeypatch):
-    # The CLI can report an API error (overloaded, rate limited) inside a
-    # successful exit. That text is not the model's answer: no caller should
-    # treat it as a draft, and the Writer must not count it as a bad one.
-    import sellbird.brain as brain_mod
+async def test_local_ollama_error_is_no_reply_not_model_text(state):
     from sellbird.brain import Brain
+    from sellbird.local_ai.ollama_client import OllamaUnavailable
 
-    payloads = []
-
-    async def fake_exec(*cmd, **kwargs):
-        return _ClaudeProcess(payloads.pop(0))
-
-    async def no_sleep(*a, **kw):
-        return None
-
-    monkeypatch.setattr(brain_mod.asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr(brain_mod.asyncio, "sleep", no_sleep)
     brain = Brain(state)
 
-    payloads[:] = [{"type": "result", "is_error": True, "result": "API Error: 529 Overloaded"}] * 5
-    assert await brain.think("hi", max_retries=1) == ""
-    assert await brain.think_json("hi") is None and brain.last_reply_empty is True
+    async def failed_generate(prompt, *, expect_json=False):
+        raise OllamaUnavailable(
+            "Cannot connect to local Ollama"
+        )
 
-    payloads[:] = [{"type": "result", "is_error": False, "result": '{"ok": true}'}]
-    assert await brain.think_json("hi") == {"ok": True} and brain.last_reply_empty is False
+    brain.ollama.generate = failed_generate
+
+    assert await brain.think("hi") == ""
+
+    result = await brain.think_json("hi")
+    assert result is None
+    assert brain.last_reply_empty is True
+
+    async def successful_generate(prompt, *, expect_json=False):
+        return '{"ok": true}'
+
+    brain.ollama.generate = successful_generate
+
+    assert await brain.think_json("hi") == {"ok": True}
+    assert brain.last_reply_empty is False
