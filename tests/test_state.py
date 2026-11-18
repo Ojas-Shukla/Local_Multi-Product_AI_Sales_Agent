@@ -113,3 +113,48 @@ async def test_contacts_for_company(state):
 
     contacts = await state.get_contacts_for_company(cid)
     assert len(contacts) == 2
+
+
+@pytest.mark.asyncio
+async def test_product_specific_ai_records_persist_and_upsert(state):
+    prospect_id = await state.add_prospect(Prospect(
+        first_name="Ada", last_name="Lovelace", email="ada@records.test", title="COO",
+    ))
+
+    buying = {"overall_strength": "moderate", "signals": []}
+    await state.save_buying_signal_classification(
+        prospect_id, "product-a", buying, "qwen3:1.7b", 3,
+    )
+    fetched_buying = await state.get_buying_signal_classification(prospect_id, "product-a")
+    assert fetched_buying["payload"] == buying
+    assert fetched_buying["provider"] == "ollama_local"
+    assert fetched_buying["source_count"] == 3
+
+    email = {"subject": "Hello", "body": "Draft only", "status": "draft_only"}
+    await state.save_personalised_email(prospect_id, "product-a", email, "qwen3:1.7b")
+    assert (await state.get_personalised_email(prospect_id, "product-a"))["payload"] == email
+
+    reply = {"intent": "interested", "summary": "Asked for details"}
+    await state.save_reply_classification(prospect_id, "product-a", reply, "qwen3:1.7b")
+    assert (await state.get_reply_classification(prospect_id, "product-a"))["payload"] == reply
+
+    problem = {"problem_statement": "Potential workflow friction"}
+    await state.save_problem_statement(prospect_id, "product-a", problem, "qwen3:1.7b")
+    assert (await state.get_problem_statement(prospect_id, "product-a"))["payload"] == problem
+
+    score = {"score": 78, "tier": "medium_priority"}
+    await state.save_prospect_ai_score(prospect_id, "product-a", score, "qwen3:1.7b")
+    assert (await state.get_prospect_ai_score(prospect_id, "product-a"))["payload"] == score
+
+    # The same prospect can have separate results for different products.
+    await state.save_prospect_ai_score(
+        prospect_id, "product-b", {"score": 35, "tier": "poor_fit"}, "qwen3:1.7b",
+    )
+    assert (await state.get_prospect_ai_score(prospect_id, "product-a"))["payload"]["score"] == 78
+    assert (await state.get_prospect_ai_score(prospect_id, "product-b"))["payload"]["score"] == 35
+
+    # Re-running a workflow replaces the latest result instead of duplicating rows.
+    await state.save_prospect_ai_score(
+        prospect_id, "product-a", {"score": 82, "tier": "high_priority"}, "qwen3:1.7b",
+    )
+    assert (await state.get_prospect_ai_score(prospect_id, "product-a"))["payload"]["score"] == 82

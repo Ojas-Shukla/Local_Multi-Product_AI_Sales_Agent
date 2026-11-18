@@ -595,6 +595,74 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_prospect_research_updated
         ON prospect_research(updated_at);
     """,
+    # ── v20: durable product-specific sales intelligence outputs ──
+    """
+    CREATE TABLE IF NOT EXISTS buying_signal_classifications (
+        prospect_id TEXT NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+        product_id TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL,
+        model TEXT DEFAULT '',
+        provider TEXT DEFAULT 'ollama_local',
+        source_count INTEGER DEFAULT 0,
+        generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (prospect_id, product_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_buying_signals_updated
+        ON buying_signal_classifications(updated_at);
+
+    CREATE TABLE IF NOT EXISTS personalised_email_drafts (
+        prospect_id TEXT NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+        product_id TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL,
+        model TEXT DEFAULT '',
+        provider TEXT DEFAULT 'ollama_local',
+        generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (prospect_id, product_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_personalised_email_updated
+        ON personalised_email_drafts(updated_at);
+
+    CREATE TABLE IF NOT EXISTS reply_classifications (
+        prospect_id TEXT NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+        product_id TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL,
+        model TEXT DEFAULT '',
+        provider TEXT DEFAULT 'ollama_local',
+        generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (prospect_id, product_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_reply_classifications_updated
+        ON reply_classifications(updated_at);
+
+    CREATE TABLE IF NOT EXISTS prospect_problem_statements (
+        prospect_id TEXT NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+        product_id TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL,
+        model TEXT DEFAULT '',
+        provider TEXT DEFAULT 'ollama_local',
+        generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (prospect_id, product_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_problem_statements_updated
+        ON prospect_problem_statements(updated_at);
+
+    CREATE TABLE IF NOT EXISTS prospect_ai_scores (
+        prospect_id TEXT NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+        product_id TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL,
+        model TEXT DEFAULT '',
+        provider TEXT DEFAULT 'ollama_local',
+        generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (prospect_id, product_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_prospect_ai_scores_updated
+        ON prospect_ai_scores(updated_at);
+    """,
 ]
 
 BRAIN_PROVIDERS = ("ollama",)
@@ -2280,6 +2348,129 @@ class StateManager:
         except (TypeError, json.JSONDecodeError):
             result['research'] = {}
         return result
+
+    # ── Product-specific local AI prospect intelligence ──
+
+    async def _save_prospect_ai_record(self, table: str, prospect_id: str,
+                                       product_id: str, payload: dict, model: str,
+                                       source_count: int | None = None) -> None:
+        """Upsert one product-specific local AI result.
+
+        Table names are selected only by the fixed wrappers below, never by
+        request data. Keeping the payload as JSON lets each workflow evolve
+        without repeated schema migrations for individual result fields.
+        """
+        allowed = {
+            "buying_signal_classifications", "personalised_email_drafts",
+            "reply_classifications", "prospect_problem_statements", "prospect_ai_scores",
+        }
+        if table not in allowed:
+            raise ValueError("Unsupported prospect AI record type")
+        columns = "prospect_id, product_id, payload_json, model, provider"
+        values = "?, ?, ?, ?, 'ollama_local'"
+        params = [prospect_id, product_id or "", json.dumps(payload, ensure_ascii=False), model or ""]
+        if source_count is not None:
+            columns += ", source_count"
+            values += ", ?"
+            params.append(max(0, int(source_count)))
+        async with self._connect() as db:
+            await db.execute(
+                f"INSERT INTO {table} ({columns}, generated_at, updated_at) "
+                f"VALUES ({values}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(prospect_id, product_id) DO UPDATE SET "
+                "payload_json=excluded.payload_json, model=excluded.model, "
+                "provider='ollama_local', generated_at=CURRENT_TIMESTAMP, "
+                "updated_at=CURRENT_TIMESTAMP"
+                + (", source_count=excluded.source_count" if source_count is not None else ""),
+                tuple(params),
+            )
+            await db.commit()
+
+    async def _get_prospect_ai_record(self, table: str, prospect_id: str,
+                                      product_id: str = "") -> dict | None:
+        allowed = {
+            "buying_signal_classifications", "personalised_email_drafts",
+            "reply_classifications", "prospect_problem_statements", "prospect_ai_scores",
+        }
+        if table not in allowed:
+            raise ValueError("Unsupported prospect AI record type")
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"SELECT * FROM {table} WHERE prospect_id = ? AND product_id = ?",
+                (prospect_id, product_id or ""),
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        try:
+            result["payload"] = json.loads(result.pop("payload_json"))
+        except (TypeError, json.JSONDecodeError):
+            result["payload"] = {}
+        return result
+
+    async def save_buying_signal_classification(self, prospect_id: str, product_id: str,
+                                                classification: dict, model: str,
+                                                source_count: int = 0) -> None:
+        await self._save_prospect_ai_record(
+            "buying_signal_classifications", prospect_id, product_id,
+            classification, model, source_count,
+        )
+
+    async def get_buying_signal_classification(self, prospect_id: str,
+                                                product_id: str = "") -> dict | None:
+        return await self._get_prospect_ai_record(
+            "buying_signal_classifications", prospect_id, product_id,
+        )
+
+    async def save_personalised_email(self, prospect_id: str, product_id: str,
+                                      draft: dict, model: str) -> None:
+        await self._save_prospect_ai_record(
+            "personalised_email_drafts", prospect_id, product_id, draft, model,
+        )
+
+    async def get_personalised_email(self, prospect_id: str,
+                                     product_id: str = "") -> dict | None:
+        return await self._get_prospect_ai_record(
+            "personalised_email_drafts", prospect_id, product_id,
+        )
+
+    async def save_reply_classification(self, prospect_id: str, product_id: str,
+                                        classification: dict, model: str) -> None:
+        await self._save_prospect_ai_record(
+            "reply_classifications", prospect_id, product_id, classification, model,
+        )
+
+    async def get_reply_classification(self, prospect_id: str,
+                                       product_id: str = "") -> dict | None:
+        return await self._get_prospect_ai_record(
+            "reply_classifications", prospect_id, product_id,
+        )
+
+    async def save_problem_statement(self, prospect_id: str, product_id: str,
+                                     statement: dict, model: str) -> None:
+        await self._save_prospect_ai_record(
+            "prospect_problem_statements", prospect_id, product_id, statement, model,
+        )
+
+    async def get_problem_statement(self, prospect_id: str,
+                                    product_id: str = "") -> dict | None:
+        return await self._get_prospect_ai_record(
+            "prospect_problem_statements", prospect_id, product_id,
+        )
+
+    async def save_prospect_ai_score(self, prospect_id: str, product_id: str,
+                                     score: dict, model: str) -> None:
+        await self._save_prospect_ai_record(
+            "prospect_ai_scores", prospect_id, product_id, score, model,
+        )
+
+    async def get_prospect_ai_score(self, prospect_id: str,
+                                    product_id: str = "") -> dict | None:
+        return await self._get_prospect_ai_record(
+            "prospect_ai_scores", prospect_id, product_id,
+        )
 
     async def get_setting(self, key: str, default: str = "") -> str:
         async with self._connect() as db:
