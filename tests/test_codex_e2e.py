@@ -71,13 +71,25 @@ class Harness:
         self.between = {}
         self.scout_runs = 0
         self.set_config(provider, model)
+        # Gmail integration tests use a mocked local Ollama installation.
+        # Keep Brain.preflight() active, but don't require a real Ollama server.
+        if provider == "ollama":
+            from sellbird.local_ai.ollama_client import OllamaClient
+
+            async def mock_require_model(_self):
+                return None
+
+            monkeypatch.setattr(
+                OllamaClient,
+                "require_model",
+                mock_require_model,
+            )
 
         runtimes = tmp_path / "runtimes"
         runtimes.mkdir(exist_ok=True)
         monkeypatch.setattr(tempfile, "tempdir", str(runtimes))
         monkeypatch.setattr(hc, "find_codex", lambda: "codex")
         monkeypatch.setattr(hc, "native_codex_home", lambda: self.native)
-        monkeypatch.setattr(brain_mod, "RETRY_BASE_DELAY", 0)
         real_exec = asyncio.create_subprocess_exec
 
         async def exec_routed(program, *args, **kwargs):

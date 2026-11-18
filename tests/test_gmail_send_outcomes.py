@@ -127,7 +127,7 @@ async def test_no_token_does_not_attempt_send(monkeypatch):
 @pytest.mark.asyncio
 async def test_transport_read_failure_then_recovery_sends_once(monkeypatch, tmp_path):
     from tests.test_codex_e2e import Harness, _approved_item
-    harness = Harness(monkeypatch, tmp_path, provider='claude', model='')
+    harness = Harness(monkeypatch,tmp_path,provider='ollama',model='qwen3:1.7b')
     await harness.state.init_db()
     await _approved_item(harness.state)
     reads, posts, after_failure = [], [], []
@@ -156,7 +156,7 @@ async def test_transport_read_failure_then_recovery_sends_once(monkeypatch, tmp_
 @pytest.mark.asyncio
 async def test_transport_second_page_unsubscribe_precedes_send(monkeypatch, tmp_path):
     from tests.test_codex_e2e import Harness, _approved_item
-    harness = Harness(monkeypatch, tmp_path, provider='claude', model='')
+    harness = Harness(monkeypatch,tmp_path,provider='ollama',model='qwen3:1.7b')
     await harness.state.init_db()
     await _approved_item(harness.state)
     await harness.state.mark_reply_processed('old')
