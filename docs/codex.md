@@ -1,5 +1,10 @@
 # Using a ChatGPT plan instead (Codex)
 
+> **Legacy documentation:** this checkout uses local Ollama inference only.
+> The Codex provider described below is not available in the application.
+> Configure Ollama and the `qwen3:1.7b` default model using
+> [Local AI](./local-ai.md).
+
 ## Using a ChatGPT plan instead (Codex)
 
 Claude is the default and needs no change. If you'd rather spend a ChatGPT plan (Plus, Pro, Business, …), Sellbird can think through the [Codex CLI](https://developers.openai.com/codex) instead — still a subscription, never per-token API billing.

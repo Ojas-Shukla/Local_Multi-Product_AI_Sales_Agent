@@ -143,53 +143,69 @@ def test_windows_setup_checks_refuse_codex(native_home, on_windows):
 
 
 @pytest.mark.asyncio
-async def test_windows_quota_and_brain_pause_cleanly(on_windows, tmp_path):
-    import json as _json
-
-    from sellbird.brain import BRAIN_STATUS_KEY, Brain
+async def test_ollama_brain_is_platform_independent(on_windows, tmp_path):
+    from sellbird.brain import Brain
     from sellbird.config import BrainConfig
     from sellbird.state import StateManager
 
     state = StateManager(str(tmp_path / "w.db"))
     await state.init_db()
-    brain = Brain(state, BrainConfig(provider="codex", model="gpt-5.5"))
-    assert await brain.quota.get_utilization() is None
-    problem = await brain.preflight()
-    assert "macOS and Linux" in problem
-    stored = _json.loads(await state.get_setting(BRAIN_STATUS_KEY))
-    assert stored["status"] == "paused" and stored["kind"] == "setup"
-    assert await brain.think("hi") == ""
+    brain = Brain(state, BrainConfig(provider="ollama", model="qwen3:1.7b"))
+
+    async def require_model():
+        return None
+
+    async def generate(prompt, *, expect_json=False):
+        return "local Ollama response"
+
+    brain.ollama.require_model = require_model
+    brain.ollama.generate = generate
+    assert brain.quota is None
+    assert await brain.preflight() == ""
+    assert await brain.think("hi") == "local Ollama response"
 
 
-def test_windows_setup_offers_claude_instead(monkeypatch, on_windows, capsys):
+def test_setup_uses_ollama_as_the_only_brain_provider(monkeypatch, on_windows, capsys):
     import sellbird.setup as setup_mod
     from sellbird.config import BrainConfig
 
-    answers = iter(["codex", "claude", ""])
-    monkeypatch.setattr(setup_mod, "_ask", lambda *a, **k: next(answers))
-    assert setup_mod._ask_brain_config() == BrainConfig()
-    assert "macOS and Linux" in capsys.readouterr().out
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen3:1.7b")
+    prompts = []
+
+    def answer(prompt, **kwargs):
+        prompts.append((prompt, kwargs))
+        return kwargs.get("default", "")
+
+    monkeypatch.setattr(setup_mod, "_ask", answer)
+    config = setup_mod._ask_brain_config()
+    assert config == BrainConfig(provider="ollama", model="qwen3:1.7b")
+    output = capsys.readouterr().out
+    assert "Ollama" in output
+    assert "Claude" not in output and "Codex" not in output
+    assert prompts[0][0] == "Local Ollama model"
 
 
 @pytest.mark.asyncio
-async def test_claude_is_unaffected_on_windows(on_windows, monkeypatch, tmp_path):
-    import sellbird.brain as brain_mod
+async def test_local_ollama_generation_uses_the_configured_model(on_windows, tmp_path):
     from sellbird.brain import Brain
+    from sellbird.config import BrainConfig
     from sellbird.state import StateManager
 
-    class Proc:
-        returncode = 0
-
-        async def communicate(self, data=None):
-            return b'{"type": "result", "result": "ok", "session_id": "s"}', b""
-
-    async def fake_claude(*cmd, **kwargs):
-        assert cmd[0] == "claude"
-        return Proc()
-
-    monkeypatch.setattr(brain_mod.asyncio, "create_subprocess_exec", fake_claude)
-    state = StateManager(str(tmp_path / "c.db"))
+    state = StateManager(str(tmp_path / "local.db"))
     await state.init_db()
-    brain = Brain(state)
+    brain = Brain(state, BrainConfig(provider="ollama", model="qwen3:1.7b"))
+    requested = {}
+
+    async def require_model():
+        return None
+
+    async def generate(prompt, *, expect_json=False):
+        requested["model"] = brain.ollama.settings.model
+        requested["prompt"] = prompt
+        return "local response"
+
+    brain.ollama.require_model = require_model
+    brain.ollama.generate = generate
     assert await brain.preflight() == ""
-    assert await brain.think("hello") == "ok"
+    assert await brain.think("hello") == "local response"
+    assert requested == {"model": "qwen3:1.7b", "prompt": "hello"}

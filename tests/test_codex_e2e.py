@@ -1,39 +1,30 @@
-"""End-to-end: the real heartbeat, agents, Brain and Codex adapter, driven
-through the scripted Codex CLI (tests/fake_codex.py).
+"""End-to-end: the real heartbeat, agents, and Brain, using a local Ollama
+fixture instead of requiring a running model server.
 
 Everything outside Sellbird is a fixture: a disposable database and config,
 a capturing mail transport (nothing is ever sent over the network), a
-stubbed Scout and profiler (they would reach the internet), and a fake
-ChatGPT login. These tests check what an operator would see across whole
-heartbeat cycles: what is queued or sent, what is consumed, what is
-counted, and what happens when Codex can't be used.
+stubbed Scout and profiler (they would reach the internet), and a mocked
+Ollama model. These tests check what an operator would see across whole
+heartbeat cycles: what is queued or sent, what is consumed, what is counted,
+and what happens when local inference can't be used.
 """
 
 import asyncio
 import json
-import os
 import sqlite3
-import sys
-import tempfile
 from pathlib import Path
 
 import pytest
 
 import sellbird.brain as brain_mod
-import sellbird.codex as hc
-
-# The Codex provider supports macOS and Linux only (see sellbird.codex).
-pytestmark = pytest.mark.skipif(sys.platform == "win32",
-                                reason="the Codex provider isn't supported on Windows")
 import sellbird.main as main_mod
 from sellbird.config import EnvConfig, SellbirdConfig
 from sellbird.integrations.mail_provider import InboundMessage
 from sellbird.models.conversation import Conversation, Message
+from sellbird.local_ai.ollama_client import OllamaUnavailable
 from sellbird.state import StateManager
-from tests.test_codex import _write_login
 from tests.test_outbox_native import FakeProvider, _now_iso, seed_prospect
 
-FAKE = str(Path(__file__).with_name("fake_codex.py"))
 FIXTURES = Path(__file__).with_name("fixtures")
 
 BASE = {
@@ -46,24 +37,15 @@ BASE = {
     "channels": {"email": {"provider": "smtp", "require_approval": True}},
 }
 
-FAKE_CLAUDE = (
-    "import json, sys; sys.stdin.read() if not sys.stdin.isatty() else None; "
-    "print(json.dumps({'type': 'result', 'result': 'question', 'session_id': 's',"
-    " 'usage': {'input_tokens': 3, 'output_tokens': 1}}))"
-)
-
-
 class Harness:
-    """One disposable Sellbird install wired to fixtures."""
+    """One disposable Sellbird install wired to local inference fixtures."""
 
-    def __init__(self, monkeypatch, tmp_path, provider="codex", model="gpt-5.5", db=None):
+    def __init__(self, monkeypatch, tmp_path, provider="ollama", model="qwen3:1.7b", db=None):
         self.tmp = tmp_path
         self.monkeypatch = monkeypatch
-        self.log = tmp_path / "codex.log"
         self.scenario = "smart"
-        self.native = tmp_path / "native-codex"
-        self.native.mkdir(exist_ok=True)
-        _write_login(self.native)
+        self.model_calls = 0
+        self.fail_call = None
         self.state = StateManager(str(db or tmp_path / "sellbird.db"))
         self.mail = FakeProvider()
         self.cycles = 0
@@ -74,33 +56,112 @@ class Harness:
         # Gmail integration tests use a mocked local Ollama installation.
         # Keep Brain.preflight() active, but don't require a real Ollama server.
         if provider == "ollama":
-            from sellbird.local_ai.ollama_client import OllamaClient
+            from sellbird.local_ai.ollama_client import (
+                OllamaClient,
+                OllamaError,
+                OllamaModelNotFound,
+            )
 
-            async def mock_require_model(_self):
-                return None
+            async def mock_require_model(client):
+                if self.scenario == "server_down":
+                    raise OllamaUnavailable("Cannot connect to local Ollama server")
+                if client.settings.model == "missing-model":
+                    raise OllamaModelNotFound(
+                        f"Model {client.settings.model!r} is not installed"
+                    )
+
+            async def mock_generate(
+                client,
+                prompt,
+                *,
+                system=None,
+                temperature=0.2,
+                expect_json=False,
+            ):
+                self.model_calls += 1
+                if self.fail_call == self.model_calls:
+                    raise OllamaUnavailable("Synthetic local Ollama outage")
+                if self.scenario == "server_down":
+                    raise OllamaUnavailable("Cannot connect to local Ollama server")
+                prompt_lower = prompt.lower()
+
+                # Simulate an empty model response for the human-escalation test.
+                if self.scenario == "commentary_only":
+                    if "classify this email reply" in prompt_lower:
+                        return "interested"
+                    raise OllamaError("Ollama returned an empty model response")
+
+                # Reply classification.
+                if "classify this email reply" in prompt_lower:
+                    return "interested"
+
+                # Writer: three-email sequence.
+                if expect_json and (
+                    "3-email cold outreach sequence" in prompt_lower
+                    or "return only a json array" in prompt_lower
+                ):
+                    return json.dumps([
+                        {
+                            "step": 1,
+                            "subject": "Improving team workflows",
+                            "body": (
+                                "Hi Jane,\\n\\n"
+                                "I noticed your work at Acme Tools. "
+                                "Would improving team workflows be a priority?\\n\\n"
+                                "Best,\\nSellbird"
+                            ),
+                            "delay_days": 0,
+                        },
+                        {
+                            "step": 2,
+                            "subject": "Following up",
+                            "body": (
+                                "Hi Jane,\\n\\n"
+                                "I wanted to follow up on my earlier note. "
+                                "Would a short conversation be useful?\\n\\n"
+                                "Best,\\nSellbird"
+                            ),
+                            "delay_days": 3,
+                        },
+                        {
+                            "step": 3,
+                            "subject": "One last note",
+                            "body": (
+                                "Hi Jane,\\n\\n"
+                                "Would it be worth revisiting this later?\\n\\n"
+                                "Best,\\nSellbird"
+                            ),
+                            "delay_days": 4,
+                        },
+                    ])
+
+                # Writer: individual personalised email.
+                if expect_json:
+                    return json.dumps({
+                        "subject": "Improving team workflows",
+                        "body": (
+                            "Hi Jane,\\n\\n"
+                            "I noticed your work at Acme Tools. "
+                            "Would improving team workflows be a priority?"
+                        ),
+                    })
+
+                # Handler: draft a reply to an interested prospect.
+                return (
+                    "Happy to help. Our pricing starts at $10. "
+                    "Would you like me to share the details?"
+                )
 
             monkeypatch.setattr(
                 OllamaClient,
                 "require_model",
                 mock_require_model,
             )
-
-        runtimes = tmp_path / "runtimes"
-        runtimes.mkdir(exist_ok=True)
-        monkeypatch.setattr(tempfile, "tempdir", str(runtimes))
-        monkeypatch.setattr(hc, "find_codex", lambda: "codex")
-        monkeypatch.setattr(hc, "native_codex_home", lambda: self.native)
-        real_exec = asyncio.create_subprocess_exec
-
-        async def exec_routed(program, *args, **kwargs):
-            if program == "codex":
-                return await real_exec(sys.executable, FAKE, self.scenario, str(self.log),
-                                       *args, **kwargs)
-            if program == "claude":
-                return await real_exec(sys.executable, "-c", FAKE_CLAUDE, **kwargs)
-            raise AssertionError(f"unexpected subprocess {program!r}")
-
-        monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_routed)
+            monkeypatch.setattr(
+                OllamaClient,
+                "generate",
+                mock_generate,
+            )
 
         import sellbird.agents.handler as handler_mod
         import sellbird.agents.scout as scout_mod
@@ -155,37 +216,17 @@ class Harness:
         self.between = between or {}
         await asyncio.wait_for(main_mod.heartbeat(asyncio.Event()), 120)
 
-    def entries(self):
-        if not self.log.exists():
-            return []
-        return [json.loads(line) for line in self.log.read_text().splitlines()]
-
-    def count(self, key, value):
-        return sum(1 for e in self.entries() if e.get(key) == value)
-
     async def status(self):
         return brain_mod.parse_brain_status(await self.state.get_setting(brain_mod.BRAIN_STATUS_KEY))
 
-    def fail_from_call(self, n, scenario="hooks"):
-        """Switch the CLI to ``scenario`` at the n-th model call (preflight
-        checks aren't model calls), e.g. to fail the reply draft only. It
-        stays failing until ``recover()``."""
-        real_run = hc.CodexClient.run
-        calls = {"n": 0}
-
-        async def run(client, prompt, timeout, skip_if=None):
-            calls["n"] += 1
-            if calls["n"] == n:
-                self.scenario = scenario
-            return await real_run(client, prompt, timeout, skip_if=skip_if)
-
-        self.monkeypatch.setattr(hc.CodexClient, "run", run)
-        return calls
+    def fail_from_call(self, n):
+        """Fail the selected model request with a local Ollama outage."""
+        self.fail_call = n
 
     def recover(self):
-        """The operator fixes Codex; the paused Brain re-checks next cycle."""
+        """Restore the local Ollama fixture for the next heartbeat cycle."""
         self.scenario = "smart"
-        self.monkeypatch.setattr(brain_mod, "PROVIDER_RECHECK_SECONDS", 0)
+        self.fail_call = None
 
 
 @pytest.fixture
@@ -234,13 +275,11 @@ async def test_reply_is_classified_answered_for_review_and_never_reprocessed(sel
     assert replies[0]["body"].startswith("Happy to help")
     assert sellbird.mail.sent == []  # approval required: nothing leaves
     assert await sellbird.state.is_reply_processed("in-1")
-    # Exactly two model calls (classify + draft), counted once, on Codex only.
-    assert sellbird.count("cmd", "app-server") >= 2
-    assert sum(1 for e in sellbird.entries() if "prompt_chars" in e) == 2
-    assert await sellbird.state.get_usage_today("codex") == 2
-    assert await sellbird.state.get_usage_today("claude") == 0
+    # Classification and reply drafting are both attributed to local Ollama.
+    assert sellbird.model_calls == 2
+    assert await sellbird.state.get_usage_today("ollama") == 2
     rows = await sellbird.state.usage_by_provider(days=1)
-    assert [(r["provider"], r["calls"]) for r in rows] == [("codex", 2)]
+    assert [(r["provider"], r["calls"]) for r in rows] == [("ollama", 2)]
     assert (await sellbird.status()) == {}  # never paused
 
 
@@ -251,11 +290,11 @@ async def test_approved_email_is_delivered_once_across_cycles(sellbird):
     await sellbird.run_cycles(3)
     assert [m["to"] for m in sellbird.mail.sent] == ["bob@beta.com"]
     assert len(await sellbird.state.get_outbox(status="sent")) == 1
-    assert await sellbird.state.get_usage_today("codex") == 0  # sending needs no model
+    assert await sellbird.state.get_usage_today("ollama") == 0  # sending needs no model
 
 
 @pytest.mark.asyncio
-async def test_writer_drafts_through_codex_and_waits_for_approval(sellbird):
+async def test_writer_drafts_through_ollama_and_waits_for_approval(sellbird):
     await sellbird.state.init_db()
     await seed_prospect(sellbird.state, email="jane@acme.com", status="new")
     # One cycle: the writer drafts, then (send phase, after it) the sender
@@ -264,7 +303,7 @@ async def test_writer_drafts_through_codex_and_waits_for_approval(sellbird):
     drafts = await sellbird.state.get_outbox(status="pending_review")
     assert drafts and all(d["to_email"] == "jane@acme.com" for d in drafts)
     assert sellbird.mail.sent == []
-    assert await sellbird.state.get_usage_today("codex") >= 1
+    assert await sellbird.state.get_usage_today("ollama") >= 1
     assert sellbird.scout_runs == 0
 
 
@@ -272,72 +311,57 @@ async def test_writer_drafts_through_codex_and_waits_for_approval(sellbird):
 
 
 @pytest.mark.asyncio
-async def test_expired_login_pauses_everything_and_recovers_after_renewal(sellbird):
+async def test_unavailable_ollama_pauses_everything_and_recovers(sellbird):
     await sellbird.state.init_db()
-    _write_login(sellbird.native, expires_in=-60)
-    auth = sellbird.native / "auth.json"
     _, convo_id = await _open_thread(sellbird.state)
     sellbird.mail.inbound = [_reply("Could you share pricing details?")]
     await _approved_item(sellbird.state)
+    sellbird.scenario = "server_down"
 
     await sellbird.run_cycles(2)
-    # Paused before any agent ran: no reply consumed, no email sent, no
-    # runtime started, and the reason is recorded for `sellbird status`.
+    # Preflight keeps mailbox handling and sending paused while Ollama is down.
     assert not await sellbird.state.is_reply_processed("in-1")
     assert sellbird.mail.sent == []
-    assert sellbird.count("cmd", "app-server") == 0
+    assert sellbird.model_calls == 0
     status = await sellbird.status()
-    assert status["status"] == "paused" and "expired" in status["reason"]
+    assert status["status"] == "paused" and "Ollama" in status["reason"]
     assert len((await sellbird.state.get_conversation(convo_id)).thread) == 1
 
-    before = auth.read_bytes()
-    _write_login(sellbird.native)  # the operator runs `codex login`
-    renewed = auth.read_bytes()
+    sellbird.recover()
     await sellbird.run_cycles(1)
     assert await sellbird.state.is_reply_processed("in-1")
     assert [m["to"] for m in sellbird.mail.sent] == ["bob@beta.com"]
     assert (await sellbird.status())["status"] == "ok"
-    assert renewed != before and auth.read_bytes() == renewed  # Sellbird never wrote it
 
 
 @pytest.mark.asyncio
-async def test_renewed_login_is_picked_up_without_a_restart(sellbird):
+async def test_restored_ollama_is_picked_up_without_a_restart(sellbird):
     await sellbird.state.init_db()
-    _write_login(sellbird.native, refreshed_ago=9 * 86400)  # due for renewal
+    sellbird.scenario = "server_down"
     await _open_thread(sellbird.state)
     sellbird.mail.inbound = [_reply("Could you share pricing details?")]
     seen = {}
 
     async def still_paused():
         seen["processed"] = await sellbird.state.is_reply_processed("in-1")
-        seen["launched"] = sellbird.count("cmd", "app-server")
+        seen["calls"] = sellbird.model_calls
 
-    def renew():
-        _write_login(sellbird.native)  # `codex login`, or the operator using Codex
+    def restore_ollama():
+        sellbird.recover()
 
-    await sellbird.run_cycles(3, between={1: still_paused, 2: renew})
-    assert seen == {"processed": False, "launched": 0}
+    await sellbird.run_cycles(3, between={1: still_paused, 2: restore_ollama})
+    assert seen == {"processed": False, "calls": 0}
     assert await sellbird.state.is_reply_processed("in-1")
     assert (await sellbird.status())["status"] == "ok"
 
 
 @pytest.mark.asyncio
-async def test_isolation_failure_mid_cycle_leaves_the_reply_for_later(sellbird, monkeypatch):
+async def test_ollama_outage_mid_cycle_leaves_replies_for_later(sellbird):
     await sellbird.state.init_db()
     _, convo_id = await _open_thread(sellbird.state)
     sellbird.mail.inbound = [_reply("Could you share pricing details?"),
                            _reply("Another question", provider_id="in-2")]
-    sellbird.scenario = "hooks"  # credential-free checks pass; the call's checks don't
-    seen = {}
-
-    def after_first():
-        seen["launched"] = sellbird.count("cmd", "app-server")
-
-    def after_second():
-        seen["launched_after_second"] = sellbird.count("cmd", "app-server")
-        # The operator fixes the Codex config; the periodic re-check resumes.
-        sellbird.scenario = "smart"
-        monkeypatch.setattr(brain_mod, "PROVIDER_RECHECK_SECONDS", 0)
+    sellbird.fail_from_call(1)
 
     async def check_paused():
         assert not await sellbird.state.is_reply_processed("in-1")
@@ -346,13 +370,16 @@ async def test_isolation_failure_mid_cycle_leaves_the_reply_for_later(sellbird, 
         assert convo.status == "open" and len(convo.thread) == 1  # not escalated
         assert await sellbird.state.get_outbox() == []
         assert (await sellbird.status())["status"] == "paused"
-        assert "turn/start" not in [e.get("method") for e in sellbird.entries()]
-        after_first()
 
-    await sellbird.run_cycles(3, between={1: check_paused, 2: after_second})
-    # Cycle 2 stayed paused without starting a runtime.
-    assert seen["launched_after_second"] == seen["launched"]
-    # Cycle 3 resumed and handled both replies exactly once.
+    async def pause_then_keep_down():
+        await check_paused()
+        sellbird.scenario = "server_down"
+
+    await sellbird.run_cycles(3, between={
+        1: pause_then_keep_down,
+        2: sellbird.recover,
+    })
+    # Cycle 2 stays paused; cycle 3 handles both replies exactly once.
     assert await sellbird.state.is_reply_processed("in-1")
     assert await sellbird.state.is_reply_processed("in-2")
     assert (await sellbird.status())["status"] == "ok"
@@ -368,25 +395,25 @@ async def test_rejected_model_pauses_with_an_actionable_reason(monkeypatch, tmp_
     status = await sellbird.status()
     assert status["status"] == "paused" and "missing-model" in status["reason"]
     assert not await sellbird.state.is_reply_processed("in-1")
-    assert sum(1 for e in sellbird.entries() if "prompt_chars" in e) == 0
+    assert sellbird.model_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_usage_limit_stops_calls_and_closes_the_budget(sellbird):
+async def test_ollama_outage_holds_reply_until_service_returns(sellbird):
     await sellbird.state.init_db()
     await _open_thread(sellbird.state)
     sellbird.mail.inbound = [_reply("Could you share pricing details?")]
-    sellbird.scenario = "usage_limit"
-    turns = {}
+    sellbird.scenario = "server_down"
+    paused = {}
 
-    def after_first():
-        turns["first"] = sum(1 for e in sellbird.entries() if e.get("method") == "turn/start")
+    async def after_first():
+        paused["calls"] = sellbird.model_calls
+        paused["processed"] = await sellbird.state.is_reply_processed("in-1")
+        sellbird.recover()
 
-    await sellbird.run_cycles(3, between={1: after_first})
-    assert turns["first"] == 1  # one refused turn, not one per reply or retry
-    # The next cycles in the same process keep the budget gate closed.
-    assert sum(1 for e in sellbird.entries() if e.get("method") == "turn/start") == 1
-    assert not await sellbird.state.is_reply_processed("in-1")
+    await sellbird.run_cycles(2, between={1: after_first})
+    assert paused == {"calls": 0, "processed": False}
+    assert await sellbird.state.is_reply_processed("in-1")
 
 
 @pytest.mark.asyncio
@@ -394,7 +421,7 @@ async def test_restart_clears_a_stale_paused_status(sellbird):
     """A pause recorded before a restart must not keep showing once healthy."""
     await sellbird.state.init_db()
     await sellbird.state.set_setting(brain_mod.BRAIN_STATUS_KEY, json.dumps(
-        {"provider": "codex", "status": "paused", "reason": "old", "since": "x"}))
+        {"provider": "ollama", "status": "paused", "reason": "old", "since": "x"}))
     await sellbird.run_cycles(1)
     assert (await sellbird.status())["status"] == "ok"
 
@@ -404,33 +431,35 @@ async def test_transient_failure_skips_a_cycle_then_recovers(sellbird):
     await sellbird.state.init_db()
     await _open_thread(sellbird.state)
     sellbird.mail.inbound = [_reply("Could you share pricing details?")]
-    sellbird.scenario = "crash"  # the CLI dies mid-protocol
+    sellbird.fail_from_call(1)
     await sellbird.run_cycles(1)
     assert not await sellbird.state.is_reply_processed("in-1")
-    assert (await sellbird.status()) == {}  # transient: not recorded as paused
+    assert (await sellbird.status())["status"] == "paused"
 
-    sellbird.scenario = "smart"
+    sellbird.recover()
     await sellbird.run_cycles(1)
     assert await sellbird.state.is_reply_processed("in-1")
     assert len(await sellbird.state.get_outbox(status="pending_review")) == 1
 
 
 @pytest.mark.asyncio
-async def test_no_final_answer_escalates_to_a_human_without_replying(sellbird):
-    """A healthy provider that returns no usable answer is the existing
-    Handler contract: flag for a human, never auto-reply blind."""
+async def test_empty_ollama_response_leaves_reply_for_retry(sellbird):
+    """An empty Ollama response must not consume or answer the inbound reply."""
     await sellbird.state.init_db()
     _, convo_id = await _open_thread(sellbird.state)
     sellbird.mail.inbound = [_reply("Could you share pricing details?")]
     sellbird.scenario = "commentary_only"
     await sellbird.run_cycles(1)
     convo = await sellbird.state.get_conversation(convo_id)
-    assert convo.status == "needs_human"
+    assert convo.status == "open"
+    assert [message.sender for message in convo.thread] == ["sellbird"]
     assert await sellbird.state.get_outbox() == [] and sellbird.mail.sent == []
-    assert await sellbird.state.get_usage_today("codex") == 0  # failed calls aren't counted
+    assert not await sellbird.state.is_reply_processed("in-1")
+    assert await sellbird.state.get_usage_today("ollama") == 1  # only classification succeeded
+    assert (await sellbird.status())["status"] == "paused"
 
 
-# ── existing installs and switching providers ──
+# ── existing installs and local provider ──
 
 
 def _load_pre_codex_db(path: Path):
@@ -441,10 +470,16 @@ def _load_pre_codex_db(path: Path):
 
 
 @pytest.mark.asyncio
-async def test_pre_codex_database_migrates_and_runs_on_codex(monkeypatch, tmp_path):
+async def test_pre_codex_database_migrates_and_runs_on_ollama(monkeypatch, tmp_path):
     db = tmp_path / "old.db"
     _load_pre_codex_db(db)
-    sellbird = Harness(monkeypatch, tmp_path, db=db)
+    sellbird = Harness(
+        monkeypatch,
+        tmp_path,
+        provider="ollama",
+        model="qwen3:1.7b",
+        db=db,
+    )
     await sellbird.state.init_db()
 
     rows = await sellbird.state.usage_by_provider(days=36500)
@@ -457,38 +492,7 @@ async def test_pre_codex_database_migrates_and_runs_on_codex(monkeypatch, tmp_pa
     await sellbird.run_cycles(1)
     assert await sellbird.state.is_reply_processed("in-1")
     rows = {r["provider"]: r["calls"] for r in await sellbird.state.usage_by_provider(days=36500)}
-    assert rows == {"claude": 1, "codex": 2}
-
-
-@pytest.mark.asyncio
-async def test_switching_providers_keeps_counters_and_budgets_separate(monkeypatch, tmp_path):
-    sellbird = Harness(monkeypatch, tmp_path, provider="claude", model="")
-    await sellbird.state.init_db()
-    await _open_thread(sellbird.state)
-    sellbird.mail.inbound = [_reply("Could you share pricing details?")]
-    await sellbird.run_cycles(1)
-    # Claude default path: no Codex process at all, counted as Claude.
-    assert sellbird.entries() == []
-    assert await sellbird.state.get_usage_today("claude") >= 1
-    assert await sellbird.state.get_usage_today("codex") == 0
-    claude_calls = await sellbird.state.get_usage_today("claude")
-
-    sellbird.set_config("codex", "gpt-5.5")
-    sellbird.mail.inbound = [_reply("Could you share pricing details?", provider_id="in-2")]
-    await sellbird.run_cycles(1)
-    assert await sellbird.state.get_usage_today("codex") == 2
-    assert await sellbird.state.get_usage_today("claude") == claude_calls
-
-    # The Codex budget counts Codex calls only.
-    from sellbird.brain import Brain
-    brain = Brain(sellbird.state, sellbird.config.brain)
-    brain.quota.get_utilization = _none
-    assert await brain.is_within_budget(3, max_percent=None) is True
-    assert await brain.is_within_budget(2, max_percent=None) is False
-
-
-async def _none():
-    return None
+    assert rows == {"claude": 1, "ollama": 2}
 
 
 @pytest.mark.asyncio
@@ -510,8 +514,8 @@ async def test_fixture_transport_is_the_only_mail_path(sellbird):
 
 
 class _DownBrain:
-    """A brain whose provider just became unusable mid-cycle."""
-    paused_reason = "Your Codex login has expired or is due for renewal."
+    """A brain whose local provider just became unavailable mid-cycle."""
+    paused_reason = "Cannot connect to local Ollama server."
 
     def load_skills_for_agent(self, *_):
         return ""
@@ -586,7 +590,7 @@ async def test_outage_while_drafting_the_reply_loses_nothing_and_duplicates_noth
 
     await sellbird.run_cycles(3, between={1: after_outage})
     assert seen == {"processed": False, "thread": ["sellbird"], "stage": "initial_outreach",
-                    "status": "open", "outbox": 0, "brain": "isolation"}
+                    "status": "open", "outbox": 0, "brain": "setup"}
     convo = await sellbird.state.get_conversation(convo_id)
     assert [m.sender for m in convo.thread] == ["sellbird", "prospect"]
     assert convo.stage == "engaged" and convo.intent == "interested"
@@ -607,7 +611,7 @@ async def test_instantly_reply_survives_an_outage_while_drafting(sellbird):
     _, convo_id = await _open_thread(sellbird.state)
     config = SellbirdConfig(**{**BASE, "channels": {"email": {
                                 "provider": "instantly", "require_approval": False}},
-                             "brain": {"provider": "codex", "model": "gpt-5.5"}})
+                             "brain": {"provider": "ollama", "model": "qwen3:1.7b"}})
     brain = Brain(sellbird.state, config.brain)
     handler = Handler(brain=brain, state=sellbird.state, config=config, env=EnvConfig())
     campaign = Campaign(id="c1", name="c", channel="email", sequence=[], prospect_ids=[],
@@ -654,10 +658,10 @@ async def test_rejected_model_never_sends_queued_mail(monkeypatch, tmp_path):
     await sellbird.run_cycles(1)
     assert sellbird.mail.sent == []
     status = await sellbird.status()
-    assert status["status"] == "paused" and status["kind"] == "isolation"
+    assert status["status"] == "paused" and status["kind"] == "setup"
     assert "missing-model" in status["reason"]
     assert not await sellbird.state.is_reply_processed("in-1")
-    assert not [e for e in sellbird.entries() if "prompt_chars" in e]
+    assert sellbird.model_calls == 0
     # Caught by the heartbeat preflight, before any agent ran: the mailbox
     # wasn't even read (the prospect isn't marked as having replied).
     jane = await sellbird.state.get_prospect_by_email("jane@acme.com")
@@ -706,49 +710,42 @@ async def test_a_reply_cancels_its_due_follow_up_before_the_send_phase(sellbird)
 
 
 @pytest.mark.asyncio
-async def test_usage_limit_pause_is_recorded_survives_restart_and_clears(sellbird, monkeypatch):
+async def test_ollama_outage_status_survives_restart_and_clears(sellbird):
     await sellbird.state.init_db()
     await _open_thread(sellbird.state)
     sellbird.mail.inbound = [_reply("Could you share pricing details?")]
-    sellbird.scenario = "usage_limit"
-    await sellbird.run_cycles(1)
+    sellbird.scenario = "server_down"
+    await sellbird.run_cycles(2)
     status = await sellbird.status()
-    assert status["status"] == "paused" and status["kind"] == "usage_limit"
-    assert status["until"] > __import__("time").time()
+    assert status["status"] == "paused" and "Ollama" in status["reason"]
 
-    # Restart inside the pause: no new turn, still paused.
-    turns = sum(1 for e in sellbird.entries() if e.get("method") == "turn/start")
-    sellbird.scenario = "smart"
+    # A new heartbeat while the server is down remains paused and does no work.
     await sellbird.run_cycles(1)
-    assert sum(1 for e in sellbird.entries() if e.get("method") == "turn/start") == turns
-    assert (await sellbird.status())["kind"] == "usage_limit"
+    assert (await sellbird.status())["status"] == "paused"
     assert not await sellbird.state.is_reply_processed("in-1")
 
-    # The pause runs out: recorded as recovered, and the reply is handled.
-    stored = await sellbird.status()
-    stored["until"] = __import__("time").time() - 1
-    await sellbird.state.set_setting(brain_mod.BRAIN_STATUS_KEY, json.dumps(stored))
+    # Once Ollama is restored, the next heartbeat records recovery and handles it.
+    sellbird.recover()
     await sellbird.run_cycles(1)
     assert (await sellbird.status())["status"] == "ok"
     assert await sellbird.state.is_reply_processed("in-1")
 
 
 @pytest.mark.asyncio
-async def test_usage_limit_pause_expiry_is_recorded_in_process(sellbird, monkeypatch):
+async def test_ollama_recovers_in_process_after_service_returns(sellbird):
     await sellbird.state.init_db()
     await _open_thread(sellbird.state)
     sellbird.mail.inbound = [_reply("Could you share pricing details?")]
-    sellbird.scenario = "usage_limit"
-    monkeypatch.setattr(brain_mod, "USAGE_LIMIT_PAUSE_SECONDS", 0.2)
+    sellbird.scenario = "server_down"
     seen = {}
 
-    async def after_limit():
-        seen["kind"] = (await sellbird.status()).get("kind")
-        sellbird.scenario = "smart"
-        await asyncio.sleep(0.3)
+    async def restore_after_pause():
+        seen["status"] = (await sellbird.status())["status"]
+        seen["processed"] = await sellbird.state.is_reply_processed("in-1")
+        sellbird.recover()
 
-    await sellbird.run_cycles(2, between={1: after_limit})
-    assert seen["kind"] == "usage_limit"
+    await sellbird.run_cycles(2, between={1: restore_after_pause})
+    assert seen == {"status": "paused", "processed": False}
     assert (await sellbird.status())["status"] == "ok"
     assert await sellbird.state.is_reply_processed("in-1")
 
@@ -757,7 +754,7 @@ async def test_usage_limit_pause_expiry_is_recorded_in_process(sellbird, monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider, model", [("codex", "gpt-5.5"), ("claude", "")])
+@pytest.mark.parametrize("provider, model", [("ollama", "qwen3:1.7b")])
 async def test_mailbox_error_holds_sends_until_replies_can_be_read(monkeypatch, tmp_path,
                                                                    provider, model):
     sellbird = Harness(monkeypatch, tmp_path, provider=provider, model=model)

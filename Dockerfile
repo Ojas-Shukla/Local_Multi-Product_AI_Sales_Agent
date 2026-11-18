@@ -6,9 +6,9 @@ ENV PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     SELLBIRD_HOME=/app
 
-# System deps (curl needed for the Claude CLI installer)
+# System dependencies for TLS and Playwright's browser installation.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -36,16 +36,6 @@ COPY --chown=sellbird:sellbird skills/ skills/
 COPY --chown=sellbird:sellbird sellbird.yaml .
 
 USER sellbird
-ENV PATH="/home/sellbird/.local/bin:${PATH}"
-
-# Claude Code CLI, installed as the runtime user so ~/.local/bin is correct.
-# Download separately so fetch failures cannot be hidden by a shell pipeline.
-# Fail the build if installation or Sellbird's CLI isolation check fails.
-RUN installer="$(mktemp)" \
-    && curl -fsSL https://claude.ai/install.sh -o "$installer" \
-    && bash "$installer" \
-    && rm "$installer" \
-    && python -c "from sellbird.claude_runtime import check_cli; print(check_cli())"
 
 # Healthy = the dashboard is accepting connections on its loopback port. The
 # heartbeat loop is started from the dashboard on demand, so database activity

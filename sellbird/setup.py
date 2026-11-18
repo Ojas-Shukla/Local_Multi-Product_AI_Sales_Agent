@@ -4,7 +4,6 @@ import asyncio
 import getpass
 import logging
 import os
-import shutil
 from pathlib import Path
 
 import yaml
@@ -164,18 +163,8 @@ def _product_configured() -> bool:
             and product.get("name") not in (None, "", "Your Product"))
 
 
-def _check_claude_cli() -> bool:
-    """Check if Claude CLI is installed and accessible."""
-    return shutil.which("claude") is not None
-
-
-def _check_codex_cli() -> bool:
-    """Check if Codex CLI is installed and accessible."""
-    return shutil.which("codex") is not None
-
-
-async def _test_claude(brain: Brain) -> bool:
-    """Test that the configured brain answers (Claude or Codex)."""
+async def _test_local_model(brain: Brain) -> bool:
+    """Test that the configured local Ollama model answers."""
     response = await brain.think(
         "Respond with exactly: SELLBIRD_READY",
         session_id="sellbird-setup-test",
@@ -184,35 +173,17 @@ async def _test_claude(brain: Brain) -> bool:
 
 
 def _ask_brain_config() -> BrainConfig:
-    """Ask which subscription Sellbird thinks with. Claude is the default."""
-    _print_sellbird("I think with an AI subscription you already pay for:")
-    print("    claude — your Claude plan, via Claude Code (default)")
-    print("    codex  — your ChatGPT plan, via the Codex CLI")
+    """Configure the local Ollama model used for inference."""
+    from sellbird.local_ai.ollama_client import OllamaSettings
+
+    default_model = OllamaSettings.from_env().model
+    _print_sellbird("Sellbird runs inference locally through Ollama.")
     while True:
-        provider = _ask("Which one? (claude/codex)", default="claude").lower()
-        if provider == "codex":
-            from sellbird.codex import CodexError, require_supported_platform
-            try:
-                require_supported_platform()
-            except CodexError as e:
-                print(f"    ({e})")
-                continue
-        if provider in ("claude", "codex"):
-            break
-        print("    (type claude or codex)")
-    if provider == "codex":
-        from sellbird.codex import SUGGESTED_MODEL
-        print(f"    {SUGGESTED_MODEL} is the Codex model Sellbird has verified as text-only")
-        print("    (no code-execution tools). Press Enter to use it, or type another.")
-    while True:
-        if provider == "codex":
-            model = _ask("Model", default=SUGGESTED_MODEL, required=False)
-        else:
-            model = _ask("Model (leave blank for the default)", required=False)
+        model = _ask("Local Ollama model", default=default_model, required=False)
         try:
-            return BrainConfig(provider=provider, model=model)
+            return BrainConfig(provider="ollama", model=model)
         except ValidationError:
-            print("    (that doesn't look like a model name — try again or leave blank)")
+            print("    (that doesn't look like an Ollama model name — try again)")
 
 
 async def _test_instantly(api_key: str) -> bool:
@@ -294,87 +265,25 @@ class SetupWizard:
         await self._print_summary()
 
     async def _check_prerequisites(self):
-        """Pick the brain provider and verify its CLI is installed and working."""
+        """Configure and verify local Ollama inference."""
         self.brain_config = _ask_brain_config()
-        if self.brain_config.provider == "codex":
-            await self._check_codex()
-        else:
-            await self._check_claude()
-
-    async def _check_claude(self):
-        # Check Claude CLI
-        print("\n  Checking Claude Code CLI...", end=" ")
-        if _check_claude_cli():
-            print("✓ Found")
-        else:
-            print("✗ Not found")
-            _print_sellbird("I need Claude Code CLI to think. Install it from:")
-            print("         https://claude.ai/download")
-            print("\n         After installing, run 'claude login' to authenticate,")
-            print("         then re-run this setup.")
-            raise SystemExit(1)
-
-        # Test headless mode
-        print("  Testing Claude headless mode...", end=" ", flush=True)
+        print("\n  Checking local Ollama server and model...", end=" ", flush=True)
         state = StateManager()
         await state.init_db()
         brain = Brain(state, self.brain_config)
-        if await _test_claude(brain):
-            print("✓ Working")
-        else:
-            print("✗ Failed")
-            _print_sellbird("Claude CLI is installed but headless mode isn't working.")
-            _print_sellbird("Make sure you're logged in: run 'claude login'")
-            print("\n         Also verify your Max subscription is active.")
-            if not _ask_yes_no("Continue anyway?", default=False):
-                raise SystemExit(1)
-        self._check_python_packages()
-
-    async def _check_codex(self):
-        from sellbird.codex import (
-            CODEX_INSTALL_HINT, CodexError, check_cli_version, check_native_auth,
-        )
-
-        print("\n  Checking Codex CLI...", end=" ")
-        if _check_codex_cli():
-            print("✓ Found")
-        else:
-            print("✗ Not found")
-            _print_sellbird("I need the Codex CLI to think with your ChatGPT plan:")
-            print(f"         {CODEX_INSTALL_HINT}")
-            print("\n         Then run 'codex login', choose 'Sign in with ChatGPT',")
-            print("         and re-run this setup.")
-            raise SystemExit(1)
-
-        print("  Checking Codex CLI version...", end=" ")
-        try:
-            print(f"✓ {check_cli_version()}")
-        except CodexError as e:
-            print("✗ Not supported")
-            _print_sellbird(str(e))
-            raise SystemExit(1)
-
-        print("  Checking Codex ChatGPT login...", end=" ")
-        try:
-            check_native_auth()
-            print("✓ Found")
-        except CodexError as e:
+        problem = await brain.preflight()
+        if problem:
             print("✗ Not ready")
-            _print_sellbird(str(e))
+            _print_sellbird(problem)
             raise SystemExit(1)
+        print("✓ Ready")
 
-        # A real (subscription, not API-billed) call through the same
-        # isolated runtime Sellbird uses for every prompt.
-        print("  Testing Codex (isolated, no tools)...", end=" ", flush=True)
-        state = StateManager()
-        await state.init_db()
-        brain = Brain(state, self.brain_config)
-        if await _test_claude(brain):
+        print("  Testing local Ollama model...", end=" ", flush=True)
+        if await _test_local_model(brain):
             print("✓ Working")
         else:
             print("✗ Failed")
-            _print_sellbird("Codex is installed but the test call failed. The log")
-            _print_sellbird("above says why (login, plan limits, or isolation).")
+            _print_sellbird("The local Ollama model did not return the expected response.")
             if not _ask_yes_no("Continue anyway?", default=False):
                 raise SystemExit(1)
         self._check_python_packages()
@@ -927,9 +836,9 @@ class SetupWizard:
 
         # Show what's configured
         checks = {
-            ("Codex CLI (ChatGPT plan)" if self.brain_config.provider == "codex"
-             else "Claude Code CLI"): (_check_codex_cli() if self.brain_config.provider == "codex"
-                                      else _check_claude_cli()),
+            "Local Ollama model": (
+                self.brain_config.provider == "ollama" and bool(self.brain_config.model)
+            ),
             "Instantly API": bool(self.env_vars.get("INSTANTLY_API_KEY")),
             "LinkedIn": bool(self.env_vars.get("LINKEDIN_EMAIL")),
             "Cloudflare Crawl": bool(self.env_vars.get("CLOUDFLARE_ACCOUNT_ID")),

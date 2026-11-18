@@ -15,8 +15,8 @@ icp:          { industries, titles, company_size, geography, hiring_signals, geo
 channels:
   email:      { provider: gmail | microsoft | smtp | instantly, max_daily_sends, per_inbox_daily_cap,
                 require_approval, send_to_risky, min_write_score, max_bounce_rate, follow_ups, warmup, send_window, signature }
-usage:        { max_daily_claude_percent, heartbeat_interval_minutes, quiet_hours }
-brain:        { provider: claude | codex, model, reasoning_effort }   # optional; claude by default
+usage:        { heartbeat_interval_minutes, quiet_hours }
+brain:        { provider: ollama, model }   # optional; local Ollama, qwen3:1.7b by default
 writer:       { humanizer, site_facts, require_tip }   # optional; humanizer true adds one editing pass per batch using ~/.claude/skills/humanizer/SKILL.md
               # site_facts (default true): the Writer sees what the free homepage signals found (no structured data,
               # a stale or very small site, AI crawlers blocked) so an email can name one concrete thing to change.
@@ -31,11 +31,9 @@ writer:       { humanizer, site_facts, require_tip }   # optional; humanizer tru
 
 `min_write_score` (0-100, default 0) is the lowest Scout fit score the writer
 drafts for: a prospect below it keeps its deliverable address but gets no
-sequence, so Claude calls and sends go to the best matches first.
+sequence, so model calls and sends go to the best matches first.
 
 `follow_ups` (default true) set to `false` makes a campaign stage only its first email on Gmail, Microsoft and SMTP. Steps 2 and 3 are never prepared, so none can go out to someone who has not answered. A reply is still read, and the answer waits in the Outbox for you as usual. The Writer still drafts the whole sequence; the Sender just doesn't stage the later steps.
-
-`max_daily_claude_percent` caps whichever subscription `brain.provider` uses (the name predates Codex support).
 
 If `sellbird.local.yaml` exists it wins. It's gitignored, so a fork can carry real product configuration while the tracked `sellbird.yaml` stays a template — nobody publishes their positioning and pricing by accident.
 
@@ -47,9 +45,9 @@ sellbird dashboard             # web UI at 127.0.0.1:5555 (--url: print the unlo
 sellbird signals               # review/confirm what to prospect against
 sellbird discover              # find businesses; --providers / --estimate
 sellbird profile               # read discovered companies' sites (free)
-sellbird train <url>           # learn a product from its website (--provider codex --model gpt-5.5)
+sellbird train <url>           # learn a product from its website using the configured local model
 sellbird status                # pipeline summary
-sellbird usage                 # active provider's quota + per-agent tokens
+sellbird usage                 # local model calls and per-agent usage
 sellbird outbox                # review queued email
 sellbird export                # deliverable prospects → CSV
 sellbird precleared-key        # free key for the cold-email check, saved to .env
@@ -151,4 +149,3 @@ run would cost, and pause sending. It can't approve or send email, resume
 sending, confirm signals, start discovery, change settings or keys, or delete
 anything: the dashboard answers 403 to the agent's token for every route that
 isn't on its short allowlist (`sellbird/agent_policy.py`).
-

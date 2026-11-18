@@ -7,7 +7,7 @@
   </a>
 </p>
 
-<p align="center"><strong>The open-source outreach platform that runs on your Claude or ChatGPT plan.</strong></p>
+<p align="center"><strong>The open-source outreach platform with local Ollama inference.</strong></p>
 
 <p align="center">
 Sellbird finds companies that need what you sell, finds the person who decides, checks their email address, writes each one a personal cold email, sends it and handles the replies.
@@ -61,26 +61,28 @@ Decision: write_campaign (3 new prospects with no drafts)
 Cycle complete. Sleeping for 15 minutes.
 ```
 
-## No model API bill
+## Local AI, no hosted model fallback
 
-Sellbird thinks through the Claude Code CLI on your Claude Pro or Max plan, or through Codex on a ChatGPT plan. There's no API key and no per-token billing, and Sellbird throttles itself to leave room for your own work.
+Sellbird sends model requests to your local Ollama server. The default model is
+`qwen3:1.7b`; there is no Claude, Codex, or hosted API fallback. Local inference
+has no per-token charge, but uses your machine's memory, CPU/GPU, and power.
 
 | | |
 |---|---|
-| Claude Pro or Max, or a ChatGPT plan with Codex | the subscription you already have |
+| Model inference | local Ollama; no hosted LLM account or API key |
 | Finding businesses | **$0** on the default source, or about $0.37 per 1,000 on the cheapest paid one |
 | Reading their websites | **$0**: three HTTP requests each, no model call |
-| Writing and sending | your subscription and a mailbox (about $7 a month for Google Workspace) |
+| Writing and sending | your computer and a mailbox (about $7 a month for Google Workspace) |
 | Prospecting tools | **None.** No Apollo, ZoomInfo, Clearbit or Clay. |
 
-How the loop, the budget and the isolation work: [How Sellbird works](docs/how-it-works.md).
+See [Local AI](docs/local-ai.md) for installing Ollama and configuring the model.
 
 ## Quick start
 
 You need:
 
 - **Python 3.11 or newer.** macOS ships 3.9, so run `brew install python@3.13` first if `python3 --version` says so.
-- **Claude Pro or Max** with the CLI signed in (`claude login`), or a **ChatGPT plan with the Codex CLI** ([Codex setup](docs/codex.md)).
+- **Ollama** installed and running. Pull the default model with `ollama pull qwen3:1.7b`; see [Local AI](docs/local-ai.md) for details.
 - **A mailbox to send from**, ideally Google Workspace on a separate sending domain. [Microsoft 365](docs/microsoft365.md) and SMTP work too.
 - **Warmup on that mailbox.** We recommend [TrulyInbox](https://trulyinbox.com/?via=sellbird): it warms a new mailbox before cold email and keeps it out of spam after, and Sellbird reads its inbox rate to tell you when you're ready.
 
@@ -173,7 +175,7 @@ database, the logs and the dashboard token.
 | [The dashboard and the data](docs/dashboard.md) | Every screen, how sign-in works, and how the data is stored |
 | [Configuration and commands](docs/configuration.md) | `.env`, `sellbird.yaml` and every command |
 | [Extensions](docs/extensions.md) | Adding routes, heartbeat steps and commands from a separate package |
-| [Using a ChatGPT plan (Codex)](docs/codex.md) | Running on Codex instead of Claude |
+| [Local AI](docs/local-ai.md) | Ollama setup, model configuration, and local-only inference behavior |
 | [Legal and deliverability](docs/deliverability.md) | The rules you're sending under, and warmup |
 | [Microsoft 365](docs/microsoft365.md) · [Precleared](docs/precleared.md) | Provider setup guides |
 | [Docker](docs/docker.md) · [Troubleshooting](docs/troubleshooting.md) · [Roadmap](docs/roadmap.md) | Running, fixing and what's next |

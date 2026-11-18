@@ -482,8 +482,7 @@ async def test_setup_trains_into_the_file_sellbird_reads(files, monkeypatch, has
     assert outputs == [str(files.config.with_name(name))]
 
 
-async def summary(wizard, monkeypatch, capsys) -> str:
-    monkeypatch.setattr(setup, "_check_claude_cli", lambda: True)
+async def summary(wizard, capsys) -> str:
     capsys.readouterr()
     await wizard._print_summary()
     return capsys.readouterr().out
@@ -497,7 +496,7 @@ async def test_summary_shows_whether_the_check_was_saved_on(files, monkeypatch, 
     wizard._setup_compliance()
     finish(wizard)
 
-    out = await summary(wizard, monkeypatch, capsys)
+    out = await summary(wizard, capsys)
     assert ("✓ Cold-email check (Precleared)" in out) is turn_on
     assert ("– Cold-email check (Precleared)" in out) is not turn_on
 
@@ -515,5 +514,5 @@ async def test_a_config_that_cannot_be_saved_is_reported_not_ticked(files, monke
 
     assert "Couldn't save" in capsys.readouterr().out
     assert files.config.read_text() == "channels:\n"
-    out = await summary(wizard, monkeypatch, capsys)
+    out = await summary(wizard, capsys)
     assert "– Cold-email check (Precleared)" in out
