@@ -25,6 +25,14 @@ from tests.test_dashboard_signals import client  # noqa: F401  (fixture)
 def yaml_file(tmp_path):
     path = tmp_path / "sellbird.yaml"
     shutil.copy(PROJECT_ROOT / "sellbird.yaml", path)
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    approval_lines = [i for i, line in enumerate(lines) if "require_approval:" in line]
+    assert len(approval_lines) == 1
+    index = approval_lines[0]
+    line = lines[index]
+    newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+    lines[index] = f"{line.split('#', 1)[0].rstrip()}  # native{newline}"
+    path.write_text("".join(lines), encoding="utf-8")
     return path
 
 

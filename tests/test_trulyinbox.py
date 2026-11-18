@@ -225,7 +225,9 @@ def test_the_link_lives_in_one_constant():
     from sellbird.paths import PROJECT_ROOT
     src = [p for p in (PROJECT_ROOT / "sellbird").rglob("*") if p.suffix in (".py", ".js", ".html")]
     assert [p.name for p in src if "trulyinbox.com/?via" in p.read_text(encoding="utf-8")] == ["trulyinbox.py"]
-    for name in ("README.md", "CLAUDE.md", "sellbird.yaml"):
+    # sellbird.yaml may be an operator's customized runtime config in a
+    # checkout, so only assert links in stable project documentation.
+    for name in ("README.md", "CLAUDE.md"):
         text = (PROJECT_ROOT / name).read_text(encoding="utf-8")
         assert ti.AFFILIATE_URL in text, name
         # every link to the site carries the referral

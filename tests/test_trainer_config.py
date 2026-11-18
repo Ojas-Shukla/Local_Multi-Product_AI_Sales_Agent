@@ -129,7 +129,20 @@ def test_first_training_keeps_the_template_settings(tmp_path):
     # Precleared block) carry over, and the untrained placeholder persona
     # is replaced with what training learned.
     template = tmp_path / "sellbird.yaml"
-    shipped = (PROJECT_ROOT / "sellbird.yaml").read_text()
+    template_config = yaml.safe_load((PROJECT_ROOT / "sellbird.yaml").read_text())
+    template_config["persona"] = {
+        "name": "Alex",
+        "company": "Your Company",
+        "role": "Business Development",
+        "email": "",
+        "linkedin": "",
+        "tone": "professional, consultative, confident",
+    }
+    template_config["product"]["name"] = "Your Product"
+    template_config["product"]["offer"]["goal"] = "book_call"
+    template_config["channels"]["email"]["provider"] = "gmail"
+    template_config["compliance"]["precleared"]["enabled"] = False
+    shipped = yaml.safe_dump(template_config, sort_keys=False)
     template.write_text(shipped)
     path = tmp_path / "sellbird.local.yaml"
     out = write_trained_config(LEARNED, path)
